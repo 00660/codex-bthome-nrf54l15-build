@@ -2,6 +2,9 @@ name: build
 
 on:
   push:
+    # 只改文档不用跑一次 5 分钟的构建
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 jobs:
