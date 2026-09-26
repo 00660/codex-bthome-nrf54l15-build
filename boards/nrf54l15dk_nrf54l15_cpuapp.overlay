@@ -1,0 +1,78 @@
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+#include <zephyr/dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		ntcpower = &ntc_power;
+	};
+
+	ntc_power_pins {
+		compatible = "gpio-leds";
+
+		ntc_power: ntc-power {
+			gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	zephyr,user {
+		io-channels = <&adc 0>, <&adc 1>;
+	};
+};
+
+/*
+ * P1.02(NFC1) / P1.03(NFC2) 复位后默认是 NFC 天线脚。
+ * 模组第 8 脚 = P1.02，用来接 IP5328 的 KEY 网络，必须先把 NFC 关掉。
+ * nfct-pins-as-gpios 会让构建系统定义 NRF_CONFIG_NFCT_PINS_AS_GPIOS，
+ * SystemInit() 启动时自动清掉 NFC 的 PADCONFIG。
+ */
+&nfct {
+	status = "disabled";
+};
+
+&uicr {
+	nfct-pins-as-gpios;
+};
+
+&uart20 {
+	status = "disabled";
+};
+
+&spi00 {
+	status = "disabled";
+};
+
+&mx25r64 {
+	status = "disabled";
+};
+
+&pwm20 {
+	status = "disabled";
+};
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,vref-mv = <900>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN4>;
+		zephyr,resolution = <12>;
+	};
+
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,vref-mv = <900>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <12>;
+	};
+
+};
