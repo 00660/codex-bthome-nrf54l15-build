@@ -138,7 +138,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 25U
+#define IP5328_DIAG_LEN 30U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -872,6 +872,33 @@ static int ip_line_has_pullup(uint32_t pin)
 }
 
 /*
+ * 给一根线做两次测试，用来判断它到底有没有接在东西上。
+ *
+ *   驱动到低再放开        —— 线上有外部上拉就会马上回高
+ *   驱动到高再放开，等 1ms —— 悬空的脚靠引脚电容把电平撑住，还是高；
+ *                            接在对地阻抗上的脚会在这段时间内泄干净，掉到低
+ *
+ * 两个结果合起来：
+ *   低 / 高 → 悬空，这根线什么都没接
+ *   高 / 高 → 接在一个有上拉的网络上
+ *   低 / 低 → 接在对地阻抗上（一颗电阻，或者芯片在推低）
+ */
+static void ip_line_probe(uint32_t pin, uint8_t *low_release, uint8_t *high_release)
+{
+	(void)gpio_pin_configure(ip_port, pin, GPIO_OUTPUT_LOW);
+	k_busy_wait(50);
+	(void)gpio_pin_configure(ip_port, pin, GPIO_INPUT);
+	k_busy_wait(50);
+	*low_release = (uint8_t)(gpio_pin_get(ip_port, pin) ? 1U : 0U);
+
+	(void)gpio_pin_configure(ip_port, pin, GPIO_OUTPUT_HIGH);
+	k_busy_wait(50);
+	(void)gpio_pin_configure(ip_port, pin, GPIO_INPUT);
+	k_msleep(1);
+	*high_release = (uint8_t)(gpio_pin_get(ip_port, pin) ? 1U : 0U);
+}
+
+/*
  * 布局（24 字节）。
  * 接线顺序已定死：模组 5 脚(P1.13) = SCL，6 脚(P1.14) = SDA，不再试别的组合。
  *
@@ -897,6 +924,12 @@ static int ip_line_has_pullup(uint32_t pin)
  *   [22]    按 KEY 之后 INT(P1.04) 加内部上拉时的电平
  *   [23]    按 KEY 之后快速全地址扫描命中数
  *   [24]    按 KEY 放开 50ms 后第 8 脚的电平，1 = KEY 网络上确实有上拉
+ *   [25]    [26] 第 8 脚：驱动低放开 / 驱动高放开 1ms 后的电平
+ *   [27]    [28] 第 7 脚（INT）：同上
+ *   [29]    第 13 脚（NFC2，本该悬空）：驱动低放开后的电平
+ *
+ *   [25]~[29] 用来分开"没上拉"和"悬空"：
+ *   低/高 = 悬空，什么都没接；高/高 = 接在有上拉的网络上；低/低 = 接在对地阻抗上。
  *
  *   [18] 判断"芯片进没进 I2C 模式"：
  *   没进模式时 RSET(21) 只是对地的内阻设定电阻，内部上拉压不过 → 低；
@@ -914,6 +947,7 @@ static void ip5328_diag_run(void)
 	uint8_t first_slow = 0U;
 	uint8_t n_fast = 0U;
 	uint8_t n_slow = 0U;
+	uint8_t unused_high = 0U;
 
 	/*
 	 * 第一件事：别碰总线，先听。
@@ -1029,16 +1063,35 @@ static void ip5328_diag_run(void)
 	}
 	ip5328_diag[23] = n_fast;
 
+	/*
+	 * 最后一组：挨个确认这几根线到底有没有接在东西上。
+	 * [24] 只说"8 脚放开后没上拉"，但"没上拉"和"悬空"是两回事，
+	 * 再驱动到高放开一次就能分开。
+	 */
+	ip_line_probe(IP5328_PIN_M8, &ip5328_diag[25], &ip5328_diag[26]);
+	ip_line_probe(IP5328_PIN_M7, &ip5328_diag[27], &ip5328_diag[28]);
+	ip_line_probe(IP5328_PIN_NFC2, &ip5328_diag[29], &unused_high);
+
+	/* 三根线各自还原：8 脚按键输入，7 脚 INT 输入，13 脚高阻 */
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT);
+	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8,
+					   GPIO_INT_EDGE_TO_INACTIVE);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_NFC2, GPIO_INPUT);
+
 	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
 		"nak=%u/%u/%u hits=%u,%u slow=%u,%u edges=%u/%u "
-		"afterkey=%u int=%u hits=%u keynet=%u",
+		"afterkey=%u int=%u hits=%u keynet=%u "
+		"m8=%u/%u m7=%u/%u nfc2=%u",
 		ip5328_diag[1], ip5328_diag[17], ip5328_diag[18], ip5328_diag[2],
 		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
 		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
 		ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], ip5328_diag[14],
 		ip5328_diag[15], ip5328_diag[16], ip5328_diag[19],
 		ip5328_diag[20], ip5328_diag[21], ip5328_diag[22],
-		ip5328_diag[23], ip5328_diag[24]);
+		ip5328_diag[23], ip5328_diag[24], ip5328_diag[25],
+		ip5328_diag[26], ip5328_diag[27], ip5328_diag[28],
+		ip5328_diag[29]);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
