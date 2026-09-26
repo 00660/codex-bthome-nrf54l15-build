@@ -129,6 +129,12 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define IP5328_DIAG_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0202, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
+/* 版本号特征，只读，手机端直接看字符串，不用去解广播 */
+#define APP_INFO_SERVICE_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0300, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+#define APP_VERSION_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0301, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+
 /* ---------------- GPIO 测试开关 ---------------- */
 
 #define GPIO_SWITCH_COUNT 22U
@@ -274,6 +280,8 @@ GPIO_SWITCH_LIST(GPIO_SWITCH_UUID_DEFINE)
 static const struct bt_uuid_128 ip5328_service_uuid = BT_UUID_INIT_128(IP5328_SERVICE_UUID_VAL);
 static const struct bt_uuid_128 ip5328_report_uuid = BT_UUID_INIT_128(IP5328_REPORT_UUID_VAL);
 static const struct bt_uuid_128 ip5328_diag_uuid = BT_UUID_INIT_128(IP5328_DIAG_UUID_VAL);
+static const struct bt_uuid_128 app_info_service_uuid = BT_UUID_INIT_128(APP_INFO_SERVICE_UUID_VAL);
+static const struct bt_uuid_128 app_version_uuid = BT_UUID_INIT_128(APP_VERSION_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
@@ -1210,6 +1218,25 @@ static ssize_t read_ip5328_diag(struct bt_conn *conn, const struct bt_gatt_attr 
 				 sizeof(ip5328_diag));
 }
 
+/*
+ * 版本串在编译期就拼好，和 BTHome 广播里的 0xF2 对象同源（都来自 VERSION 文件），
+ * 不用运行时初始化，也不会出现两处版本号不一致。
+ */
+#define APP_VER_STR_(x) #x
+#define APP_VER_STR(x) APP_VER_STR_(x)
+static const char app_version_str[] = APP_VER_STR(APP_VERSION_MAJOR) "."
+				     APP_VER_STR(APP_VERSION_MINOR) "."
+				     APP_VER_STR(APP_PATCHLEVEL);
+
+static ssize_t read_app_version(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(attr);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, app_version_str,
+				 strlen(app_version_str));
+}
+
 #define GPIO_SWITCH_GATT_ENTRY(index, port_node, pin_number, label) \
 	BT_GATT_CHARACTERISTIC(&gpio_switch_uuid_##index.uuid, \
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE, \
@@ -1246,6 +1273,13 @@ BT_GATT_SERVICE_DEFINE(ip5328_service,
 	BT_GATT_CHARACTERISTIC(&ip5328_diag_uuid.uuid, BT_GATT_CHRC_READ,
 			       BT_GATT_PERM_READ, read_ip5328_diag, NULL, NULL),
 	BT_GATT_CUD("I2C diag", BT_GATT_PERM_READ),
+);
+
+BT_GATT_SERVICE_DEFINE(app_info_service,
+	BT_GATT_PRIMARY_SERVICE(&app_info_service_uuid),
+	BT_GATT_CHARACTERISTIC(&app_version_uuid.uuid, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_app_version, NULL, NULL),
+	BT_GATT_CUD("Version", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
