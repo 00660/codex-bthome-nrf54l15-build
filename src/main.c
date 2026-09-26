@@ -4,13 +4,14 @@
  * 传感器
  *   1. 100k NTC 分压测温（P1.10 供电 / P1.11 AIN4 采样）
  *   2. IP5328 移动电源 SOC 的 I2C 数据（电池电压/电流/功率/充电状态/电量）
- *      —— 软件 bit-bang I2C 挂在 P1.13 / P1.14，启动时自动侦测哪个是 SCL
+ *      —— 软件 bit-bang I2C 挂在 P1.13 / P1.14，接线顺序写死：
+ *         模组 5 脚 = SCL，模组 6 脚 = SDA
  *
  * 引脚（E73 模组脚 → nRF54L15）
- *   5  → P1.13   IP5328 I2C（SCL 或 SDA，运行时自动判定）
- *   6  → P1.14   IP5328 I2C（另一根）
+ *   5  → P1.13   IP5328 I2C SCL
+ *   6  → P1.14   IP5328 I2C SDA
  *   7  → P1.04   IP5328 INT/RSET 状态输入（高 = 主板醒着）
- *   8  → P1.02   IP5328 KEY 网络（NFC1，overlay 里已关 NFC）
+ *   8  → P1.02   IP5328 KEY 网络（NFC1，overlay 里已关 NFC）—— 也能主动拉低当按键用
  *   10 → P1.10   NTC 分压供电
  *   11 → P1.11   NTC ADC (AIN4)
  *
@@ -137,7 +138,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 20U
+#define IP5328_DIAG_LEN 24U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -315,6 +316,8 @@ static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
 static uint32_t ip_scl_pin;
 static uint32_t ip_sda_pin;
 static uint8_t ip_bind = IP5328_BIND_UNKNOWN;
+
+static void ip5328_key_press(uint32_t ms);
 
 /* 第 8 脚（KEY 网络）按键唤醒 */
 K_SEM_DEFINE(wake_sem, 0, 1);
@@ -612,6 +615,18 @@ static int ip5328_ensure_bind(void)
 		return 0;
 	}
 
+	/*
+	 * 不应答。IP5328 待机时整颗都可能停了 —— 手册第 20 页写着
+	 * "I2C 模式下 IP5328P 关机时 RSET 为低电平，开机时为高电平"，
+	 * 而诊断读到的 RSET 正好是低。所以先替用户按一下键把升压叫起来。
+	 */
+	ip5328_key_press(150);
+	ip_i2c_bus_recover();
+	if (ip_i2c_probe(IP5328_ADDR7) == 0) {
+		ip_bind = IP5328_BIND_A;
+		return 0;
+	}
+
 	return -ENODEV;
 }
 
@@ -751,6 +766,72 @@ static int ip5328_int_level(void)
 	return gpio_pin_get(ip_port, IP5328_PIN_M7);
 }
 
+/*
+ * 替用户按一下充电宝的按键。
+ *
+ * IP5328P 平时在待机态，手册里写得很明白：「在 I2C 模式下，IP5328P 关机时
+ * RSET 为低电平，开机时 RSET 为高电平」。待机时它整颗都可能不响应 I2C，
+ * 得先短按 KEY（>60ms）把升压输出叫起来。
+ *
+ * 模组第 8 脚就挂在 KEY 网络上，直接驱动到低就等于按下按键。
+ * 拉低期间先关掉 KEY 中断，免得自己触发一次"按键唤醒"。
+ */
+static void ip5328_key_press(uint32_t ms)
+{
+	if (!device_is_ready(ip_port)) {
+		return;
+	}
+
+	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8, GPIO_INT_DISABLE);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_OUTPUT_LOW);
+	k_msleep(ms);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT);
+	k_msleep(50);
+	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8,
+					   GPIO_INT_EDGE_TO_INACTIVE);
+}
+
+/*
+ * 把两根线当纯输入挂一会儿，数它们自己跳变了几次。
+ *
+ * 这一格是用来区分两种"完全不应答"的：
+ *   有跳变 → 这两个脚上另有主机在跑 I2C（比如接错到了 IP5328 的
+ *            I2C1 主机口 L1/L2），模组插进去只是第三个主机，谁都不理谁；
+ *   没跳变 → 线上真的什么都没发生，是 IP5328 没进从机模式。
+ */
+static void ip_listen(uint8_t *scl_edges, uint8_t *sda_edges)
+{
+	uint32_t n_scl = 0U;
+	uint32_t n_sda = 0U;
+	int last_scl;
+	int last_sda;
+
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M5, GPIO_INPUT);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M6, GPIO_INPUT);
+
+	last_scl = gpio_pin_get(ip_port, IP5328_PIN_M5);
+	last_sda = gpio_pin_get(ip_port, IP5328_PIN_M6);
+
+	for (uint32_t i = 0U; i < 20000U; i++) {
+		int scl = gpio_pin_get(ip_port, IP5328_PIN_M5);
+		int sda = gpio_pin_get(ip_port, IP5328_PIN_M6);
+
+		if (scl != last_scl) {
+			n_scl++;
+			last_scl = scl;
+		}
+		if (sda != last_sda) {
+			n_sda++;
+			last_sda = sda;
+		}
+		k_busy_wait(1);
+	}
+
+	*scl_edges = (uint8_t)MIN(n_scl, 255U);
+	*sda_edges = (uint8_t)MIN(n_sda, 255U);
+}
+
 /* ============================================================
  *  I2C 总线诊断
  * ============================================================ */
@@ -781,7 +862,7 @@ static int ip_line_has_pullup(uint32_t pin)
 }
 
 /*
- * 布局（20 字节）。
+ * 布局（24 字节）。
  * 接线顺序已定死：模组 5 脚(P1.13) = SCL，6 脚(P1.14) = SDA，不再试别的组合。
  *
  *   [0]     标志：bit0 已跑过，bit1 2µs ACK，bit2 20µs ACK，bit3 100µs ACK，
@@ -800,11 +881,21 @@ static int ip_line_has_pullup(uint32_t pin)
  *   [16]    慢速首个命中地址（7bit）
  *   [17]    INT(P1.04) 纯高阻时的电平
  *   [18]    INT(P1.04) 加内部上拉时的电平
- *   [19]    保留
+ *   [19]    按 KEY 之前，20ms 内 SCL 自己跳变了几次（饱和 255）
+ *   [20]    按 KEY 之前，20ms 内 SDA 自己跳变了几次（饱和 255）
+ *   [21]    按 KEY 之后 probe 0x75 的结果，0 = 收到 ACK，0xFF = 没测
+ *   [22]    按 KEY 之后 INT(P1.04) 加内部上拉时的电平
+ *   [23]    按 KEY 之后快速全地址扫描命中数
  *
- *   [18] 是判断"芯片进没进 I2C 模式"的关键：
- *   没进模式时 RSET(21) 只是对地的内阻设定电阻，内部上拉也压不过它 → 读到低；
- *   进了模式后它是芯片的 INT 输出（待机高阻 / 工作高电平）→ 读到高。
+ *   [18] 判断"芯片进没进 I2C 模式"：
+ *   没进模式时 RSET(21) 只是对地的内阻设定电阻，内部上拉压不过 → 低；
+ *   进了模式后它是芯片的 INT 输出（待机高阻 / 工作高电平）→ 高。
+ *   手册第 20 页：I2C 模式下 IP5328P 关机时 RSET 为低、开机时为高。
+ *
+ *   [19]/[20] 判断"线上有没有别的主机在跑"：
+ *   有跳变说明接错到了 IP5328 的 I2C1 主机口（L1/L2），不是从机口 DMB/DPB。
+ *
+ *   [21]~[23] 判断"是不是芯片在待机、按一下键就能救回来"。
  */
 static void ip5328_diag_run(void)
 {
@@ -812,6 +903,12 @@ static void ip5328_diag_run(void)
 	uint8_t first_slow = 0U;
 	uint8_t n_fast = 0U;
 	uint8_t n_slow = 0U;
+
+	/*
+	 * 第一件事：别碰总线，先听。
+	 * 后面所有探测都会往线上打时钟，只有现在能听到"线上本来在发生什么"。
+	 */
+	ip_listen(&ip5328_diag[19], &ip5328_diag[20]);
 
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	ip5328_diag[1] = (uint8_t)(ip5328_int_level() > 0 ? 1U : 0U);
@@ -898,13 +995,39 @@ static void ip5328_diag_run(void)
 	ip5328_diag[18] = (uint8_t)ip_pin_level(IP5328_PIN_M7, GPIO_PULL_UP);
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
 
+	/*
+	 * 以上都是"静默状态下"的结果。现在替用户按一下键，把 IP5328 从
+	 * 待机叫起来，再测一遍同样的东西 —— 如果待机就是原因，这一遍会通。
+	 */
+	ip5328_key_press(150);
+	k_msleep(300);
+
+	ip5328_diag[22] = (uint8_t)ip_pin_level(IP5328_PIN_M7, GPIO_PULL_UP);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
+
+	ip_i2c_set_delay(IP5328_DELAY_FAST);
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
+	ip5328_diag[21] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+
+	n_fast = 0U;
+	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
+		if (ip_i2c_probe(a) == 0) {
+			n_fast++;
+		}
+	}
+	ip5328_diag[23] = n_fast;
+
 	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
-		"nak=%u/%u/%u hits=%u,%u slow=%u,%u",
+		"nak=%u/%u/%u hits=%u,%u slow=%u,%u edges=%u/%u "
+		"afterkey=%u int=%u hits=%u",
 		ip5328_diag[1], ip5328_diag[17], ip5328_diag[18], ip5328_diag[2],
 		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
 		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
-		ip5328_diag[11], ip5328_diag[12], n_fast, first_fast, n_slow,
-		first_slow);
+		ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], ip5328_diag[14],
+		ip5328_diag[15], ip5328_diag[16], ip5328_diag[19],
+		ip5328_diag[20], ip5328_diag[21], ip5328_diag[22],
+		ip5328_diag[23]);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
