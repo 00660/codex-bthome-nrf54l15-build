@@ -138,7 +138,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 24U
+#define IP5328_DIAG_LEN 25U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -317,7 +317,7 @@ static uint32_t ip_scl_pin;
 static uint32_t ip_sda_pin;
 static uint8_t ip_bind = IP5328_BIND_UNKNOWN;
 
-static void ip5328_key_press(uint32_t ms);
+static int ip5328_key_press(uint32_t ms);
 
 /* 第 8 脚（KEY 网络）按键唤醒 */
 K_SEM_DEFINE(wake_sem, 0, 1);
@@ -775,11 +775,16 @@ static int ip5328_int_level(void)
  *
  * 模组第 8 脚就挂在 KEY 网络上，直接驱动到低就等于按下按键。
  * 拉低期间先关掉 KEY 中断，免得自己触发一次"按键唤醒"。
+ *
+ * 返回放开 50ms 后第 8 脚的电平：还在高说明 KEY 网络上确实有上拉，
+ * 模组这根线接对了。要是放开了还是低，那 8 脚根本没接在 KEY 网络上。
  */
-static void ip5328_key_press(uint32_t ms)
+static int ip5328_key_press(uint32_t ms)
 {
+	int level;
+
 	if (!device_is_ready(ip_port)) {
-		return;
+		return -1;
 	}
 
 	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8, GPIO_INT_DISABLE);
@@ -787,8 +792,13 @@ static void ip5328_key_press(uint32_t ms)
 	k_msleep(ms);
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT);
 	k_msleep(50);
+
+	level = gpio_pin_get(ip_port, IP5328_PIN_M8);
+
 	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8,
 					   GPIO_INT_EDGE_TO_INACTIVE);
+
+	return level;
 }
 
 /*
@@ -886,6 +896,7 @@ static int ip_line_has_pullup(uint32_t pin)
  *   [21]    按 KEY 之后 probe 0x75 的结果，0 = 收到 ACK，0xFF = 没测
  *   [22]    按 KEY 之后 INT(P1.04) 加内部上拉时的电平
  *   [23]    按 KEY 之后快速全地址扫描命中数
+ *   [24]    按 KEY 放开 50ms 后第 8 脚的电平，1 = KEY 网络上确实有上拉
  *
  *   [18] 判断"芯片进没进 I2C 模式"：
  *   没进模式时 RSET(21) 只是对地的内阻设定电阻，内部上拉压不过 → 低；
@@ -999,7 +1010,7 @@ static void ip5328_diag_run(void)
 	 * 以上都是"静默状态下"的结果。现在替用户按一下键，把 IP5328 从
 	 * 待机叫起来，再测一遍同样的东西 —— 如果待机就是原因，这一遍会通。
 	 */
-	ip5328_key_press(150);
+	ip5328_diag[24] = (uint8_t)(ip5328_key_press(150) > 0 ? 1U : 0U);
 	k_msleep(300);
 
 	ip5328_diag[22] = (uint8_t)ip_pin_level(IP5328_PIN_M7, GPIO_PULL_UP);
@@ -1020,14 +1031,14 @@ static void ip5328_diag_run(void)
 
 	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
 		"nak=%u/%u/%u hits=%u,%u slow=%u,%u edges=%u/%u "
-		"afterkey=%u int=%u hits=%u",
+		"afterkey=%u int=%u hits=%u keynet=%u",
 		ip5328_diag[1], ip5328_diag[17], ip5328_diag[18], ip5328_diag[2],
 		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
 		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
 		ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], ip5328_diag[14],
 		ip5328_diag[15], ip5328_diag[16], ip5328_diag[19],
 		ip5328_diag[20], ip5328_diag[21], ip5328_diag[22],
-		ip5328_diag[23]);
+		ip5328_diag[23], ip5328_diag[24]);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
