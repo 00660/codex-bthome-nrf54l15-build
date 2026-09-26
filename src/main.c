@@ -138,7 +138,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 30U
+#define IP5328_DIAG_LEN 32U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -927,6 +927,13 @@ static void ip_line_probe(uint32_t pin, uint8_t *low_release, uint8_t *high_rele
  *   [25]    [26] 第 8 脚：驱动低放开 / 驱动高放开 1ms 后的电平
  *   [27]    [28] 第 7 脚（INT）：同上
  *   [29]    第 13 脚（NFC2，本该悬空）：驱动低放开后的电平
+ *   [30]    反向组合（6 脚 = SCL，5 脚 = SDA）2µs probe 0x75，0 = 收到 ACK
+ *   [31]    反向组合全地址扫描命中数
+ *
+ *   [30]/[31] 只报结果，不参与主流程 —— 主流程一律按 5=SCL / 6=SDA 走。
+ *   加它是因为：用户是从 USB 口背面的丝印接的线，而 USB 的 DM/DP 和
+ *   IP5328 的 SCL/SDA 是交叉的（手册第 3 页：DMB = 快充识别 DM 兼 I2C2
+ *   的 SCK，DPB = 快充识别 DP 兼 SDA），照着 USB 丝印接很容易反过来。
  *
  *   [25]~[29] 用来分开"没上拉"和"悬空"：
  *   低/高 = 悬空，什么都没接；高/高 = 接在有上拉的网络上；低/低 = 接在对地阻抗上。
@@ -1064,6 +1071,26 @@ static void ip5328_diag_run(void)
 	ip5328_diag[23] = n_fast;
 
 	/*
+	 * 交叉验证一下 SCL/SDA 有没有接反。
+	 * 只探一次、只报结果，主流程用的顺序不变（还是 5=SCL / 6=SDA）。
+	 */
+	ip_i2c_set_delay(IP5328_DELAY_FAST);
+	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	ip_i2c_bus_recover();
+	ip5328_diag[30] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+
+	n_fast = 0U;
+	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
+		if (ip_i2c_probe(a) == 0) {
+			n_fast++;
+		}
+	}
+	ip5328_diag[31] = n_fast;
+
+	/* 回到用户给的顺序，下面还原引脚也按这个来 */
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+
+	/*
 	 * 最后一组：挨个确认这几根线到底有没有接在东西上。
 	 * [24] 只说"8 脚放开后没上拉"，但"没上拉"和"悬空"是两回事，
 	 * 再驱动到高放开一次就能分开。
@@ -1082,7 +1109,7 @@ static void ip5328_diag_run(void)
 	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
 		"nak=%u/%u/%u hits=%u,%u slow=%u,%u edges=%u/%u "
 		"afterkey=%u int=%u hits=%u keynet=%u "
-		"m8=%u/%u m7=%u/%u nfc2=%u",
+		"m8=%u/%u m7=%u/%u nfc2=%u rev=%u hits=%u",
 		ip5328_diag[1], ip5328_diag[17], ip5328_diag[18], ip5328_diag[2],
 		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
 		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
@@ -1091,7 +1118,7 @@ static void ip5328_diag_run(void)
 		ip5328_diag[20], ip5328_diag[21], ip5328_diag[22],
 		ip5328_diag[23], ip5328_diag[24], ip5328_diag[25],
 		ip5328_diag[26], ip5328_diag[27], ip5328_diag[28],
-		ip5328_diag[29]);
+		ip5328_diag[29], ip5328_diag[30], ip5328_diag[31]);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
