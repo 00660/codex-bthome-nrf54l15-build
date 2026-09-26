@@ -116,10 +116,18 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 
 #define IP5328_REPORT_LEN 16U
 
+/*
+ * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
+ * 是线没上拉、主板没醒、还是从机根本不应答。
+ */
+#define IP5328_DIAG_LEN 20U
+
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 #define IP5328_REPORT_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0201, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+#define IP5328_DIAG_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0202, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
 /* ---------------- GPIO 测试开关 ---------------- */
 
@@ -265,6 +273,7 @@ GPIO_SWITCH_LIST(GPIO_SWITCH_UUID_DEFINE)
 
 static const struct bt_uuid_128 ip5328_service_uuid = BT_UUID_INIT_128(IP5328_SERVICE_UUID_VAL);
 static const struct bt_uuid_128 ip5328_report_uuid = BT_UUID_INIT_128(IP5328_REPORT_UUID_VAL);
+static const struct bt_uuid_128 ip5328_diag_uuid = BT_UUID_INIT_128(IP5328_DIAG_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
@@ -339,9 +348,21 @@ static const struct bt_data sd[] = {
  *  IP5328 软件 I2C
  * ============================================================ */
 
+/* 软件 I2C 半周期，约 100kHz 上下，够用且对中断抖动不敏感 */
+static uint32_t ip_bit_delay_us = IP5328_BIT_DELAY_US;
+
 static inline void ip_dly(void)
 {
-	k_busy_wait(IP5328_BIT_DELAY_US);
+	k_busy_wait(ip_bit_delay_us);
+}
+
+/*
+ * 诊断时可以切到慢速（~25kHz）。从机如果嫌快不应答，慢下来就能通，
+ * 这样能区分"线没接好"和"时序太快"两种完全不同的故障。
+ */
+static void ip_i2c_set_slow(bool slow)
+{
+	ip_bit_delay_us = slow ? 20U : IP5328_BIT_DELAY_US;
 }
 
 static inline void ip_scl_low(void)
@@ -673,6 +694,120 @@ static int ip5328_int_level(void)
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
 
 	return gpio_pin_get(ip_port, IP5328_PIN_M7);
+}
+
+/* ============================================================
+ *  I2C 总线诊断
+ * ============================================================ */
+
+static uint8_t ip5328_diag[IP5328_DIAG_LEN];
+
+static int ip_pin_level(uint32_t pin, gpio_flags_t flags)
+{
+	(void)gpio_pin_configure(ip_port, pin, GPIO_INPUT | flags);
+	k_busy_wait(20);
+
+	return gpio_pin_get(ip_port, pin) ? 1 : 0;
+}
+
+/*
+ * 把线驱动到低，再放开成高阻，然后立刻读。
+ * 线上有外部上拉（或对端在推高）就会马上回到高；什么都没接就停在低。
+ * 这是判断"上拉到底在不在"最直接的办法，内部上下拉都太弱，分不清。
+ */
+static int ip_line_has_pullup(uint32_t pin)
+{
+	(void)gpio_pin_configure(ip_port, pin, GPIO_OUTPUT_LOW);
+	k_busy_wait(50);
+	(void)gpio_pin_configure(ip_port, pin, GPIO_INPUT);
+	k_busy_wait(50);
+
+	return gpio_pin_get(ip_port, pin) ? 1 : 0;
+}
+
+/*
+ * 布局（20 字节）：
+ *   [0]     标志：bit0 已跑过，bit1 组合A 正常速 ACK，bit2 组合B 正常速 ACK
+ *   [1]     INT/RSET(P1.04) 电平，1 = 主板醒着
+ *   [2..3]  SCL/SDA 纯高阻电平
+ *   [4..5]  SCL/SDA 内部上拉电平
+ *   [6..7]  SCL/SDA 内部下拉电平
+ *   [8..9]  SCL/SDA 释放后恢复电平，1 = 有外部上拉
+ *   [10..11] 组合A/B 正常速度 probe 0xEA，0 = 收到 ACK
+ *   [12..13] 组合A/B 慢速 probe 0xEA，0 = 收到 ACK
+ *   [14..17] 组合A 地址扫描命中数 + 前 3 个命中地址（7bit）
+ *   [18..19] 组合B 地址扫描命中数 + 首个命中地址
+ */
+static void ip5328_diag_run(void)
+{
+	uint8_t hits_a[3] = { 0 };
+	uint8_t hits_b[3] = { 0 };
+	uint8_t n_a = 0U;
+	uint8_t n_b = 0U;
+
+	ip5328_diag[1] = (uint8_t)(ip5328_int_level() > 0 ? 1U : 0U);
+
+	/* 先量静态电平，最后才探测 —— 探测本身会扰动总线 */
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip5328_diag[2] = (uint8_t)ip_pin_level(IP5328_PIN_M5, 0);
+	ip5328_diag[3] = (uint8_t)ip_pin_level(IP5328_PIN_M6, 0);
+	ip5328_diag[4] = (uint8_t)ip_pin_level(IP5328_PIN_M5, GPIO_PULL_UP);
+	ip5328_diag[5] = (uint8_t)ip_pin_level(IP5328_PIN_M6, GPIO_PULL_UP);
+	ip5328_diag[6] = (uint8_t)ip_pin_level(IP5328_PIN_M5, GPIO_PULL_DOWN);
+	ip5328_diag[7] = (uint8_t)ip_pin_level(IP5328_PIN_M6, GPIO_PULL_DOWN);
+	ip5328_diag[8] = (uint8_t)ip_line_has_pullup(IP5328_PIN_M5);
+	ip5328_diag[9] = (uint8_t)ip_line_has_pullup(IP5328_PIN_M6);
+
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip5328_diag[10] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	ip5328_diag[11] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+
+	ip_i2c_set_slow(true);
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip5328_diag[12] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	ip5328_diag[13] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+	ip_i2c_set_slow(false);
+
+	/* 全地址扫一遍：万一从机地址不是 0x75，也能发现 */
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
+		if (ip_i2c_probe(a) == 0 && n_a < ARRAY_SIZE(hits_a)) {
+			hits_a[n_a++] = a;
+		}
+	}
+	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
+		if (ip_i2c_probe(a) == 0 && n_b < ARRAY_SIZE(hits_b)) {
+			hits_b[n_b++] = a;
+		}
+	}
+
+	ip5328_diag[0] = (uint8_t)(1U | (ip5328_diag[10] == 0 ? 0x02U : 0U) |
+				   (ip5328_diag[11] == 0 ? 0x04U : 0U));
+	ip5328_diag[14] = n_a;
+	ip5328_diag[15] = hits_a[0];
+	ip5328_diag[16] = hits_a[1];
+	ip5328_diag[17] = hits_a[2];
+	ip5328_diag[18] = n_b;
+	ip5328_diag[19] = hits_b[0];
+
+	/*
+	 * 正常速度两边都不通、慢速至少一边通 —— 说明从机只是嫌快，
+	 * 那就固定用慢速，免得真正读数据时又失败。
+	 */
+	if (ip5328_diag[10] != 0 && ip5328_diag[11] != 0 &&
+	    (ip5328_diag[12] == 0 || ip5328_diag[13] == 0)) {
+		ip_i2c_set_slow(true);
+	}
+
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+
+	LOG_INF("diag int=%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u nak=%u%u slow=%u%u hits=%u,%u",
+		ip5328_diag[1], ip5328_diag[2], ip5328_diag[3], ip5328_diag[4], ip5328_diag[5],
+		ip5328_diag[6], ip5328_diag[7], ip5328_diag[8], ip5328_diag[9],
+		ip5328_diag[10], ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], n_a, n_b);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
@@ -1066,6 +1201,15 @@ static ssize_t read_ip5328_report(struct bt_conn *conn, const struct bt_gatt_att
 				 sizeof(ip5328_report));
 }
 
+static ssize_t read_ip5328_diag(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(attr);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, ip5328_diag,
+				 sizeof(ip5328_diag));
+}
+
 #define GPIO_SWITCH_GATT_ENTRY(index, port_node, pin_number, label) \
 	BT_GATT_CHARACTERISTIC(&gpio_switch_uuid_##index.uuid, \
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE, \
@@ -1090,12 +1234,18 @@ BT_GATT_SERVICE_DEFINE(gpio_switch_service,
  *   [10:12] VSYS 电压 mV
  *   [12:14] VSYS 电流 mA（有符号）
  *   [14:16] 功率 mW
+ *
+ * 诊断特征（20 字节，见 ip5328_diag_run 里的布局说明）用来排查读不通的原因：
+ * 上拉在不在、主板醒没醒、probe 有没有 ACK、地址对不对。
  */
 BT_GATT_SERVICE_DEFINE(ip5328_service,
 	BT_GATT_PRIMARY_SERVICE(&ip5328_service_uuid),
 	BT_GATT_CHARACTERISTIC(&ip5328_report_uuid.uuid, BT_GATT_CHRC_READ,
 			       BT_GATT_PERM_READ, read_ip5328_report, NULL, NULL),
 	BT_GATT_CUD("IP5328 report", BT_GATT_PERM_READ),
+	BT_GATT_CHARACTERISTIC(&ip5328_diag_uuid.uuid, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_ip5328_diag, NULL, NULL),
+	BT_GATT_CUD("I2C diag", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
@@ -1150,6 +1300,7 @@ static int start_advertising(void)
 static void advertise_then_stop(k_timeout_t duration)
 {
 	int ret = start_advertising();
+	uint32_t waited_s = 0U;
 
 	if (ret) {
 		return;
@@ -1157,8 +1308,17 @@ static void advertise_then_stop(k_timeout_t duration)
 
 	k_sleep(duration);
 
-	while (connected) {
+	/*
+	 * 有人连着就等它断开再收摊，但最多再等 10 分钟 ——
+	 * 万一 OTA 客户端异常没断开，不能把设备永远挂在这儿。
+	 */
+	while (connected && waited_s < 600U) {
 		k_sleep(K_SECONDS(1));
+		waited_s++;
+	}
+
+	if (connected) {
+		LOG_WRN("client still connected, dropping the window");
 	}
 
 	(void)bt_le_adv_stop();
@@ -1209,22 +1369,6 @@ int main(void)
 	};
 	publish_sensors(&capture, &ip);
 
-	/*
-	 * 固件能跑到这里说明镜像本身是好的，直接把 MCUboot 的镜像标记为已确认。
-	 * 这样 OTA 客户端可以放心用 upload(upgrade=False)（不设永久标记），
-	 * 万一新镜像有问题还能自动回滚；正常启动则在这里落定，不会回滚。
-	 */
-	ret = boot_write_img_confirmed();
-	if (ret) {
-		LOG_WRN("image confirm failed: %d", ret);
-	}
-
-	ret = bt_enable(NULL);
-	if (ret) {
-		LOG_ERR("Bluetooth init failed: %d", ret);
-		return ret;
-	}
-
 	configure_gpio_switches();
 
 	ret = configure_ip5328_io();
@@ -1253,6 +1397,21 @@ int main(void)
 		}
 	}
 
+	/*
+	 * 初始化全都过了才确认镜像：万一新固件在初始化阶段就崩，
+	 * MCUboot 下次启动会把它回滚掉，不会把设备卡死。
+	 */
+	ret = boot_write_img_confirmed();
+	if (ret) {
+		LOG_WRN("image confirm failed: %d", ret);
+	}
+
+	ret = bt_enable(NULL);
+	if (ret) {
+		LOG_ERR("Bluetooth init failed: %d", ret);
+		return ret;
+	}
+
 	while (true) {
 		if (!sensor_ready) {
 			ret = configure_io();
@@ -1276,11 +1435,16 @@ int main(void)
 			}
 		}
 
+		/*
+		 * 每轮都重跑一次诊断：按键唤醒也会走到这里，
+		 * 所以按一下充电宝的键就能拿到一份最新的总线状态。
+		 */
+		ip5328_diag_run();
+
 		ret = ip5328_sample(&ip);
 		if (ret) {
 			LOG_WRN("IP5328 sample failed: %d (bind=%u)", ret, ip_bind);
 		}
-
 		publish_sensors(&capture, &ip);
 
 		/* OTA 窗口：这段时间可连接广播，电脑端轮询到就能刷机 */
