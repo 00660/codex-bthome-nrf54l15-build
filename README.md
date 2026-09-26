@@ -1,0 +1,190 @@
+# nRF54L15 NTC + IP5328 BTHome 固件
+
+面向 `E73-2G4M08S1F / nRF54L15`。当前固件在原来的 100k NTC 测温版基础上，
+增加了 IP5328 移动电源 SOC 的 I2C 数据读取，并把电池电流也放进 BTHome 广播。
+
+- `P1.10` 只在采样时给 NTC 分压上电
+- `P1.11 / AIN4` 采样 NTC 分压点
+- 同时读 SAADC `VDD` 通道，用实际 GPIO 高电平换算 NTC 电阻
+- 软件 bit-bang I2C 挂在 `P1.13 / P1.14`，**启动时自动侦测哪个是 SCL**
+- 读 IP5328 的电池电压、电流、功率、充电状态、电量
+- BLE 广播 BTHome v2：temperature、battery、voltage、current、firmware version
+- **双唤醒**：每 10 分钟定时醒一次 + 模组第 8 脚按键随时唤醒
+- 每轮醒来广播 120 秒（OTA 窗口），之后停止广播进入低功耗睡眠
+- MCUboot 双槽升级
+
+## 接线
+
+### NTC
+
+```text
+P1.10(GPIO供电) -> 100k固定电阻 -> P1.11/AIN4(ADC) -> 100k NTC -> GND
+```
+
+### IP5328
+
+| 信号 | IP5328 侧 | E73 模组脚 | nRF54L15 | 说明 |
+|---|---|---|---|---|
+| I2C | DMB (6) | **5** | P1.13 | 与第 6 脚谁当 SCL 由固件自动判定 |
+| I2C | DPB (7) | **6** | P1.14 | 同上 |
+| INT/RSET | 21 | **7** | P1.04 | 输入，主板醒着为高 |
+| KEY | 26 | **8** | P1.02 | 按键网络，下降沿唤醒 MCU（NFC1） |
+
+- I2C 两根线各用 `4.7k` 上拉到 IP5328 的 `VREG`(3.1V)，**不能上拉到 VDD 或 3.3V**。
+- 第 8 脚是 `P1.02 = NFC1`，复位后默认是 NFC 天线脚。overlay 里已经用
+  `&uicr { nfct-pins-as-gpios; };` 关掉 NFC，不用改硬件。
+- 第 8 脚配成**纯高阻输入**，不开内部上拉：KEY 网络在 IP5328 内部本来就有上拉，
+  再叠一个 MCU 内部上拉会白耗约 240µA，把深睡电流整个毁掉。
+- 第 13 脚（`P1.03 = NFC2`）配成高阻不驱动。两个 NFC 脚被驱动到不同电平会有额外漏电流。
+
+## 唤醒与 OTA 窗口
+
+```text
+上电 ──────────► 采样 → 广播 120 秒 → 停止广播 → 睡
+每 10 分钟 ────► 采样 → 广播 120 秒 → 停止广播 → 睡
+第 8 脚按下 ───► 采样 → 广播 120 秒 → 停止广播 → 睡
+```
+
+- 两种唤醒走同一套流程。定时唤醒用 `k_sem_take(&wake_sem, K_MINUTES(10))` 的超时实现，
+  按键唤醒由 `P1.02` 的下降沿中断 `k_sem_give()` 提前打断，所以一个等待点同时覆盖两种来源。
+- **广播期间始终可连接**。OTA 客户端就是"一直轮询扫描 + 撞上窗口就连"，
+  所以任何一个窗口都必须允许连接，不能只在某个特定窗口才可连。
+- 连上之后不会睡：`advertise_then_stop()` 里会一直等到连接断开才停止广播。
+- 上电后第一轮也走同样流程，保证刷完固件还能连上验证或重刷。
+
+## BLE 广播
+
+设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 18 字节 service data）。
+
+BTHome service data（18 字节）：
+
+```text
+D2 FC 40 01 BB 02 TT TT 0C VV VV 5D CC CC F2 PP MM JJ
+```
+
+| 字节 | 内容 |
+|---|---|
+| `D2 FC` | BTHome UUID，小端 |
+| `40` | BTHome v2，未加密 |
+| `01 BB` | battery，uint8，单位 % |
+| `02 TT TT` | temperature，sint16，factor 0.01 °C |
+| `0C VV VV` | voltage，uint16，factor 0.001 V（IP5328 的 BATOCV 开路电压） |
+| `5D CC CC` | current (signed)，sint16，factor 0.001 A，充电为正、放电为负 |
+| `F2 PP MM JJ` | firmware version，patch / minor / major |
+
+⚠️ **BTHome 要求 object id 按数值从小到大排列**，接收端碰到不认识的 id 会直接停止解析后面的内容。
+所以顺序必须是 `01 < 02 < 0C < 5D < F2`，改字段时别打乱。
+
+⚠️ 电流用的是 **`0x5D`（signed current）**，不是 `0x43`。`0x43` 是无符号版本，
+电池放电时会因为负数被解释成很大的正数。
+
+电量百分比：IP5328 读到数据时用 BATOCV 查放电曲线表算；读不到时回退到原来的 VDD 电压法。
+
+## IP5328 GATT 报告
+
+除了广播，还挂了一个只读特征值 `6F6B0201-8C9A-4CC4-A848-16B7E44F5415`，
+可以读到 IP5328 的全部数据（16 字节，小端）：
+
+| 偏移 | 内容 |
+|---|---|
+| `[0]` | `0` = 读取失败；否则低 2 bit 是引脚组合（1 = 5脚SCL/6脚SDA，2 = 反过来） |
+| `[1]` | bit0~2 系统状态，bit4 充电中，bit6 已充满 |
+| `[2]` | bit0~2 充电阶段（0 IDLE / 1 涓流 / 2 恒流 / 3 恒压 / 4 停充检测 / 5 充满 / 6 超时） |
+| `[3]` | 电量 % |
+| `[4:6]` | BATOCV 开路电压 mV |
+| `[6:8]` | BATVAD 端电压 mV |
+| `[8:10]` | BATIAD 电池电流 mA（有符号） |
+| `[10:12]` | VSYS 电压 mV |
+| `[12:14]` | VSYS 电流 mA（有符号） |
+| `[14:16]` | 功率 mW |
+
+寄存器来源与换算：
+
+| 寄存器 | 内容 | 换算 |
+|---|---|---|
+| 0xD1 | 系统状态 / 充电 / 充满 | 见上表 |
+| 0xD7 | 充电阶段 | 见上表 |
+| 0x7B:0x7A | BATOCV | mV = raw × 0.26855 + 2600 |
+| 0x65:0x64 | BAT 端电压 | mV = raw × 0.26855 + 2600 |
+| 0x67:0x66 | BAT 端电流 | mA = raw × 1.27883，补码，充正放负 |
+| 0x69:0x68 | VSYS 电压 | mV = raw × 1.61133 + 15600 |
+| 0x6B:0x6A | VSYS 电流 | mA = raw × 0.6394 |
+| 0x7D:0x7C | 功率 | mW = raw × 8.44 |
+
+从机地址写 `0xEA` / 读 `0xEB`（7bit = `0x75`），地址小端（低字节地址在前）。
+
+## 软件 I2C 的引脚自动判定
+
+用户不确定焊的是 `5=SCL/6=SDA` 还是反的，所以固件启动时两个组合都试一遍：
+
+```text
+组合 A：5 脚 = SCL，6 脚 = SDA  → probe 0xEA
+组合 B：6 脚 = SCL，5 脚 = SDA  → probe 0xEA
+```
+
+谁收到 ACK 就用谁，之后固定不再重试。判定结果可以在 GATT 报告的 `[0]` 字节看到，
+也会在日志里打印 `bind=`。
+
+如果两个组合都不通，会保持"未定"状态，下一轮醒来再试——所以接反了**不用重新焊接**，
+只要 IP5328 那边进了 I2C 模式就能自动适配。
+
+⚠️ 注意：IP5328 是在**上电启动时**检测引脚电平来决定进不进 I2C 模式的。
+如果一直读不到，把电池断开再重新接上（让它重新启动检测），或者插一次充电器。
+
+## GPIO 测试开关
+
+原来的 27 路 GPIO 测试服务保留，但移除了被 IP5328 占用的 5 个脚：
+
+```text
+P1.02（模组 8 脚，KEY）
+P1.03（NFC2，跟随 P1.02 电平）
+P1.04（模组 7 脚，INT）
+P1.13 / P1.14（模组 5/6 脚，I2C）
+```
+
+剩余 22 路。**其余引脚的 UUID 编号保持不变**，手机端原来的配置不会错位。
+
+## 构建
+
+本机没有 NCS 时，用 GitHub Actions 构建，工作流在：
+
+```text
+.github/workflows/build.yml
+```
+
+本地有 NCS 时：
+
+```powershell
+west build -b nrf54l15dk/nrf54l15/cpuapp --sysbuild .
+```
+
+## 烧录
+
+```powershell
+python -m pyocd flash -t nrf54l "artifacts\bthome_nrf54l15_merged.hex"
+python -m pyocd reset -t nrf54l15
+```
+
+## OTA
+
+固件是"醒来才广播"的，所以 OTA 客户端要一直轮询扫描，撞上窗口就连：
+
+```text
+每轮窗口：120 秒可连接广播
+窗口之间：停止广播，低功耗睡眠
+```
+
+用 Python `smpclient` 升级：
+
+```powershell
+smpclient --ble-address EA:9F:FE:F3:26:5B --img artifacts\bthome_nrf54l15_app.signed.bin
+```
+
+如果扫不到，先按一下设备上的按键（第 8 脚 KEY 网络），设备会立刻开一个 120 秒的窗口。
+或者等下一个 10 分钟定时窗口。
+
+## 参考
+
+- BTHome official format: https://bthome.io/format/
+- Zephyr ADC API: https://docs.zephyrproject.org/latest/hardware/peripherals/adc.html
+- Zephyr SMP server / BLE OTA: https://docs.zephyrproject.org/latest/samples/subsys/mgmt/mcumgr/smp_svr/README.html
