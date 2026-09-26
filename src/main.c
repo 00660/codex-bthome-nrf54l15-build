@@ -130,7 +130,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 20U
+#define IP5328_DIAG_LEN 24U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -381,13 +381,18 @@ static inline void ip_dly(void)
 }
 
 /*
- * 诊断时可以切到慢速（~25kHz）。从机如果嫌快不应答，慢下来就能通，
+ * 诊断时可以切到慢速。从机如果嫌快不应答，慢下来就能通，
  * 这样能区分"线没接好"和"时序太快"两种完全不同的故障。
+ * 三级：2µs（~150kHz）/ 20µs（~25kHz）/ 100µs（~5kHz）。
  */
-static void ip_i2c_set_slow(bool slow)
+static void ip_i2c_set_delay(uint32_t us)
 {
-	ip_bit_delay_us = slow ? 20U : IP5328_BIT_DELAY_US;
+	ip_bit_delay_us = us;
 }
+
+#define IP5328_DELAY_FAST 2U
+#define IP5328_DELAY_MID 20U
+#define IP5328_DELAY_SLOW 100U
 
 static inline void ip_scl_low(void)
 {
@@ -442,6 +447,25 @@ static void ip_i2c_stop(void)
 	ip_dly();
 	ip_sda_rel();
 	ip_dly();
+}
+
+/*
+ * 9 个时钟 + STOP，把卡在半个字节里、正拉着 SDA 不放的从机踢出来。
+ * 从机如果死在读数据中间，不发这个它就一直不应答。
+ */
+static void ip_i2c_bus_recover(void)
+{
+	ip_sda_rel();
+	ip_dly();
+
+	for (int i = 0; i < 9; i++) {
+		ip_scl_low();
+		ip_dly();
+		ip_scl_rel();
+		ip_dly();
+	}
+
+	ip_i2c_stop();
 }
 
 /* 返回 0 = 收到 ACK */
@@ -750,28 +774,36 @@ static int ip_line_has_pullup(uint32_t pin)
 }
 
 /*
- * 布局（20 字节）：
- *   [0]     标志：bit0 已跑过，bit1 组合A 正常速 ACK，bit2 组合B 正常速 ACK
+ * 布局（24 字节）：
+ *   [0]     标志：bit0 已跑过，bit1 组合A 2µs ACK，bit2 组合B 2µs ACK，
+ *                bit3 总线恢复后 SDA 仍被拉低（从机卡住总线）
  *   [1]     INT/RSET(P1.04) 电平，1 = 主板醒着
  *   [2..3]  SCL/SDA 纯高阻电平
  *   [4..5]  SCL/SDA 内部上拉电平
  *   [6..7]  SCL/SDA 内部下拉电平
  *   [8..9]  SCL/SDA 释放后恢复电平，1 = 有外部上拉
- *   [10..11] 组合A/B 正常速度 probe 0xEA，0 = 收到 ACK
- *   [12..13] 组合A/B 慢速 probe 0xEA，0 = 收到 ACK
- *   [14..17] 组合A 地址扫描命中数 + 前 3 个命中地址（7bit）
- *   [18..19] 组合B 地址扫描命中数 + 首个命中地址
+ *   [10..11] 组合A/B 2µs   probe 0xEA，0 = 收到 ACK
+ *   [12..13] 组合A/B 20µs  probe 0xEA，0 = 收到 ACK
+ *   [14..15] 组合A/B 100µs probe 0xEA，0 = 收到 ACK
+ *   [16]    组合A 全地址扫描命中数（2µs）
+ *   [17..19] 组合A 前 3 个命中地址（7bit）
+ *   [20]    组合B 全地址扫描命中数（2µs）
+ *   [21]    组合B 首个命中地址
+ *   [22]    组合A 全地址扫描命中数（100µs）
+ *   [23]    组合A 慢速首个命中地址
  */
 static void ip5328_diag_run(void)
 {
 	uint8_t hits_a[3] = { 0 };
-	uint8_t hits_b[3] = { 0 };
+	uint8_t first_b = 0U;
+	uint8_t first_slow = 0U;
 	uint8_t n_a = 0U;
 	uint8_t n_b = 0U;
+	uint8_t n_slow = 0U;
 
 	ip5328_diag[1] = (uint8_t)(ip5328_int_level() > 0 ? 1U : 0U);
 
-	/* 先量静态电平，最后才探测 —— 探测本身会扰动总线 */
+	/* 先量静态电平，探测本身会扰动总线 */
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	ip5328_diag[2] = (uint8_t)ip_pin_level(IP5328_PIN_M5, 0);
 	ip5328_diag[3] = (uint8_t)ip_pin_level(IP5328_PIN_M6, 0);
@@ -782,56 +814,102 @@ static void ip5328_diag_run(void)
 	ip5328_diag[8] = (uint8_t)ip_line_has_pullup(IP5328_PIN_M5);
 	ip5328_diag[9] = (uint8_t)ip_line_has_pullup(IP5328_PIN_M6);
 
+	/* 三级速率各试两个引脚组合，每次先做一次总线恢复 */
+	ip_i2c_set_delay(IP5328_DELAY_FAST);
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
 	ip5328_diag[10] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
 	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	ip_i2c_bus_recover();
 	ip5328_diag[11] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
 
-	ip_i2c_set_slow(true);
+	ip_i2c_set_delay(IP5328_DELAY_MID);
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
 	ip5328_diag[12] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
 	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	ip_i2c_bus_recover();
 	ip5328_diag[13] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
-	ip_i2c_set_slow(false);
+
+	ip_i2c_set_delay(IP5328_DELAY_SLOW);
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
+	ip5328_diag[14] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+	ip_i2c_bus_recover();
+	ip5328_diag[15] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
 
 	/* 全地址扫一遍：万一从机地址不是 0x75，也能发现 */
+	ip_i2c_set_delay(IP5328_DELAY_FAST);
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
-		if (ip_i2c_probe(a) == 0 && n_a < ARRAY_SIZE(hits_a)) {
-			hits_a[n_a++] = a;
+		if (ip_i2c_probe(a) == 0) {
+			if (n_a < ARRAY_SIZE(hits_a)) {
+				hits_a[n_a] = a;
+			}
+			n_a++;
 		}
 	}
 	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
 	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
-		if (ip_i2c_probe(a) == 0 && n_b < ARRAY_SIZE(hits_b)) {
-			hits_b[n_b++] = a;
+		if (ip_i2c_probe(a) == 0) {
+			if (n_b == 0U) {
+				first_b = a;
+			}
+			n_b++;
+		}
+	}
+
+	/* 慢速再扫一遍，万一是从机嫌快 */
+	ip_i2c_set_delay(IP5328_DELAY_SLOW);
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
+		if (ip_i2c_probe(a) == 0) {
+			if (n_slow == 0U) {
+				first_slow = a;
+			}
+			n_slow++;
 		}
 	}
 
 	ip5328_diag[0] = (uint8_t)(1U | (ip5328_diag[10] == 0 ? 0x02U : 0U) |
 				   (ip5328_diag[11] == 0 ? 0x04U : 0U));
-	ip5328_diag[14] = n_a;
-	ip5328_diag[15] = hits_a[0];
-	ip5328_diag[16] = hits_a[1];
-	ip5328_diag[17] = hits_a[2];
-	ip5328_diag[18] = n_b;
-	ip5328_diag[19] = hits_b[0];
+	ip5328_diag[16] = n_a;
+	ip5328_diag[17] = hits_a[0];
+	ip5328_diag[18] = hits_a[1];
+	ip5328_diag[19] = hits_a[2];
+	ip5328_diag[20] = n_b;
+	ip5328_diag[21] = first_b;
+	ip5328_diag[22] = n_slow;
+	ip5328_diag[23] = first_slow;
 
-	/*
-	 * 正常速度两边都不通、慢速至少一边通 —— 说明从机只是嫌快，
-	 * 那就固定用慢速，免得真正读数据时又失败。
-	 */
+	/* 哪个速率能通就固定用哪个，免得真正读数据时又失败 */
 	if (ip5328_diag[10] != 0 && ip5328_diag[11] != 0 &&
 	    (ip5328_diag[12] == 0 || ip5328_diag[13] == 0)) {
-		ip_i2c_set_slow(true);
+		ip_i2c_set_delay(IP5328_DELAY_MID);
+	} else if (ip5328_diag[10] != 0 && ip5328_diag[11] != 0 &&
+		   ip5328_diag[14] != 0 && ip5328_diag[15] != 0 && n_slow > 0U) {
+		ip_i2c_set_delay(IP5328_DELAY_SLOW);
+	} else {
+		ip_i2c_set_delay(IP5328_DELAY_FAST);
 	}
 
+	/* 收摊前看看总线有没有被从机拉死 */
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
+	ip_sda_rel();
+	k_busy_wait(50);
+	if (!ip_sda_get()) {
+		ip5328_diag[0] |= 0x08U;
+	}
 
-	LOG_INF("diag int=%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u nak=%u%u slow=%u%u hits=%u,%u",
-		ip5328_diag[1], ip5328_diag[2], ip5328_diag[3], ip5328_diag[4], ip5328_diag[5],
-		ip5328_diag[6], ip5328_diag[7], ip5328_diag[8], ip5328_diag[9],
-		ip5328_diag[10], ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], n_a, n_b);
+	LOG_INF("diag int=%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
+		"nak=%u%u/%u%u/%u%u hits=%u,%u,%u stuck=%u",
+		ip5328_diag[1], ip5328_diag[2], ip5328_diag[3], ip5328_diag[4],
+		ip5328_diag[5], ip5328_diag[6], ip5328_diag[7], ip5328_diag[8],
+		ip5328_diag[9], ip5328_diag[10], ip5328_diag[11], ip5328_diag[12],
+		ip5328_diag[13], ip5328_diag[14], ip5328_diag[15], n_a, n_b, n_slow,
+		(ip5328_diag[0] >> 3) & 1U);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
