@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    container: ghcr.io/nrfconnect/sdk-nrf-toolchain:v3.2.1
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout app
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: Fetch nRF Connect SDK
+        run: |
+          python3 -m pip install --user west
+          export PATH="$HOME/.local/bin:$PATH"
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr v3.2.1 ncs
+          cd ncs
+          west update -o=--depth=1 -n
+          west zephyr-export
+          python3 -m pip install --user -r zephyr/scripts/requirements.txt -r nrf/scripts/requirements.txt -r bootloader/mcuboot/scripts/requirements.txt
+
+      - name: Build firmware
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cd ncs
+          west build -b nrf54l15dk/nrf54l15/cpuapp --sysbuild ../app -d ../build
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp build/merged.hex artifacts/bthome_nrf54l15_merged.hex
+          cp build/app/zephyr/zephyr.signed.hex artifacts/bthome_nrf54l15_app.signed.hex
+          cp build/app/zephyr/zephyr.signed.bin artifacts/bthome_nrf54l15_app.signed.bin
+          cp build/app/zephyr/zephyr.hex artifacts/bthome_nrf54l15_app.hex
+          cp build/app/zephyr/zephyr.bin artifacts/bthome_nrf54l15_app.bin
+          cp build/app/zephyr/zephyr.dts artifacts/zephyr.dts
+          cp build/app/zephyr/.config artifacts/zephyr.config
+          cp build/app/zephyr/zephyr.map artifacts/zephyr.map
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: bthome_nrf54l15_firmware
+          path: artifacts/*
