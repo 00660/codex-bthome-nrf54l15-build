@@ -104,6 +104,14 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define STAY_AWAKE_DEFAULT 1
 #define TEST_SAMPLE_INTERVAL K_SECONDS(5)
 
+/*
+ * 开机后先安静这么久，一个字节都不碰 I2C 两脚。
+ * IP5328 是在【上电那一刻】检测这两脚为高才进 I2C 模式的，
+ * 我们一上电就探测、拉低、扫描，会把它的检测过程搅掉 ——
+ * 它一旦没进模式，之后怎么读都不会应答。
+ */
+#define IP5328_QUIET_BOOT_MS 30000
+
 /* ---------------- IP5328 ---------------- */
 
 /* 模组脚号 → P1 引脚号 */
@@ -130,7 +138,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 24U
+#define IP5328_DIAG_LEN 26U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -313,6 +321,13 @@ static uint8_t ip_bind = IP5328_BIND_UNKNOWN;
 K_SEM_DEFINE(wake_sem, 0, 1);
 static struct gpio_callback key_cb;
 static volatile uint32_t key_wake_count;
+
+/*
+ * 诊断只在开机后第一次、以及按键唤醒时跑。
+ * 平时（定时/5 秒循环）不碰总线 —— 频繁探测会把 IP5328 搅得进不了 I2C 模式。
+ */
+static bool diag_ran;
+static uint32_t diag_key_count;
 
 /*
  * BTHome service data，18 字节：
@@ -791,6 +806,12 @@ static int ip_line_has_pullup(uint32_t pin)
  *   [21]    组合B 首个命中地址
  *   [22]    组合A 全地址扫描命中数（100µs）
  *   [23]    组合A 慢速首个命中地址
+ *   [24]    INT(P1.04) 加内部上拉时的电平
+ *   [25]    INT(P1.04) 纯高阻时的电平
+ *
+ *   [24] 是判断"芯片进没进 I2C 模式"的关键：
+ *   没进模式时 RSET(21) 只是对地的内阻设定电阻，内部上拉也压不过它 → 读到低；
+ *   进了模式后它是芯片的 INT 输出（待机高阻 / 工作高电平）→ 读到高。
  */
 static void ip5328_diag_run(void)
 {
@@ -903,13 +924,23 @@ static void ip5328_diag_run(void)
 		ip5328_diag[0] |= 0x08U;
 	}
 
-	LOG_INF("diag int=%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
+	/*
+	 * RSET/INT 的两种读法：
+	 *   纯高阻 —— 芯片在推高就高，是对地电阻就低
+	 *   加内部上拉 —— 能压过对地电阻就读高，压不过就读低
+	 * 两者合起来能判断"芯片到底进没进 I2C 模式"。
+	 */
+	ip5328_diag[25] = (uint8_t)ip_pin_level(IP5328_PIN_M7, 0);
+	ip5328_diag[24] = (uint8_t)ip_pin_level(IP5328_PIN_M7, GPIO_PULL_UP);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
+
+	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
 		"nak=%u%u/%u%u/%u%u hits=%u,%u,%u stuck=%u",
-		ip5328_diag[1], ip5328_diag[2], ip5328_diag[3], ip5328_diag[4],
-		ip5328_diag[5], ip5328_diag[6], ip5328_diag[7], ip5328_diag[8],
-		ip5328_diag[9], ip5328_diag[10], ip5328_diag[11], ip5328_diag[12],
-		ip5328_diag[13], ip5328_diag[14], ip5328_diag[15], n_a, n_b, n_slow,
-		(ip5328_diag[0] >> 3) & 1U);
+		ip5328_diag[1], ip5328_diag[24], ip5328_diag[25], ip5328_diag[2],
+		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
+		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
+		ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], ip5328_diag[14],
+		ip5328_diag[15], n_a, n_b, n_slow, (ip5328_diag[0] >> 3) & 1U);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
@@ -1583,6 +1614,17 @@ int main(void)
 		return ret;
 	}
 
+	/*
+	 * 开机后先安静一会儿：这期间照常广播（可以连上来刷机、读特征），
+	 * 但一个字节都不碰 I2C 两脚。
+	 *
+	 * IP5328 是在【上电那一刻】检测这两脚为高才进 I2C 模式的。
+	 * 我们以前一上电就探测、拉低、全地址扫描，很可能正好把它的检测过程搅掉，
+	 * 它一旦没进模式，之后怎么读都不会应答。
+	 */
+	(void)start_advertising();
+	k_sleep(K_MSEC(IP5328_QUIET_BOOT_MS));
+
 	while (true) {
 		if (!sensor_ready) {
 			ret = configure_io();
@@ -1607,10 +1649,14 @@ int main(void)
 		}
 
 		/*
-		 * 每轮都重跑一次诊断：按键唤醒也会走到这里，
-		 * 所以按一下充电宝的键就能拿到一份最新的总线状态。
+		 * 只在开机后第一次、以及按键唤醒时重跑诊断。
+		 * 按一下充电宝的键就能拿到一份最新的总线状态。
 		 */
-		ip5328_diag_run();
+		if (!diag_ran || key_wake_count != diag_key_count) {
+			ip5328_diag_run();
+			diag_key_count = key_wake_count;
+			diag_ran = true;
+		}
 
 		ret = ip5328_sample(&ip);
 		if (ret) {
