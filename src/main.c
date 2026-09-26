@@ -126,8 +126,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define IP5328_ADDR7 0x75U /* 写 0xEA / 读 0xEB */
 
 #define IP5328_BIND_UNKNOWN 0xFFU
-#define IP5328_BIND_A 0U /* 模组 5 脚 = SCL，6 脚 = SDA */
-#define IP5328_BIND_B 1U /* 模组 6 脚 = SCL，5 脚 = SDA */
+#define IP5328_BIND_A 0U /* 模组 5 脚 = SCL，6 脚 = SDA（接线已定死） */
 
 /* 软件 I2C 半周期，约 100kHz 上下，够用且对中断抖动不敏感 */
 #define IP5328_BIT_DELAY_US 2U
@@ -138,7 +137,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 26U
+#define IP5328_DIAG_LEN 20U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -594,32 +593,25 @@ static int ip_i2c_read_reg16(uint8_t addr7, uint8_t addr_lo, uint8_t addr_hi, ui
 }
 
 /*
- * 自动判定模组第 5/6 脚谁是 SCL。
- * 用户不确定焊的是 5=SCL/6=SDA 还是反的，所以两个组合都试一遍，
- * 谁收到 0xEA 的 ACK 就用谁，之后固定不再重试。
+ * 接线顺序已定死，不再自动判定：
+ *   模组第 5 脚 = P1.13 = SCL
+ *   模组第 6 脚 = P1.14 = SDA
+ * 所以这里只 bind 这一个组合，不做"两个组合轮着试"。
  */
 static int ip5328_ensure_bind(void)
 {
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+
 	if (ip_bind != IP5328_BIND_UNKNOWN) {
 		return 0;
 	}
 
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	k_msleep(2);
 	if (ip_i2c_probe(IP5328_ADDR7) == 0) {
 		ip_bind = IP5328_BIND_A;
 		return 0;
 	}
 
-	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
-	k_msleep(2);
-	if (ip_i2c_probe(IP5328_ADDR7) == 0) {
-		ip_bind = IP5328_BIND_B;
-		return 0;
-	}
-
-	/* 都不通：保持待定，下一轮再试 */
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	return -ENODEV;
 }
 
@@ -789,43 +781,42 @@ static int ip_line_has_pullup(uint32_t pin)
 }
 
 /*
- * 布局（24 字节）：
- *   [0]     标志：bit0 已跑过，bit1 组合A 2µs ACK，bit2 组合B 2µs ACK，
- *                bit3 总线恢复后 SDA 仍被拉低（从机卡住总线）
+ * 布局（20 字节）。
+ * 接线顺序已定死：模组 5 脚(P1.13) = SCL，6 脚(P1.14) = SDA，不再试别的组合。
+ *
+ *   [0]     标志：bit0 已跑过，bit1 2µs ACK，bit2 20µs ACK，bit3 100µs ACK，
+ *                bit4 总线恢复后 SDA 仍被拉低（从机卡住总线）
  *   [1]     INT/RSET(P1.04) 电平，1 = 主板醒着
  *   [2..3]  SCL/SDA 纯高阻电平
  *   [4..5]  SCL/SDA 内部上拉电平
  *   [6..7]  SCL/SDA 内部下拉电平
  *   [8..9]  SCL/SDA 释放后恢复电平，1 = 有外部上拉
- *   [10..11] 组合A/B 2µs   probe 0xEA，0 = 收到 ACK
- *   [12..13] 组合A/B 20µs  probe 0xEA，0 = 收到 ACK
- *   [14..15] 组合A/B 100µs probe 0xEA，0 = 收到 ACK
- *   [16]    组合A 全地址扫描命中数（2µs）
- *   [17..19] 组合A 前 3 个命中地址（7bit）
- *   [20]    组合B 全地址扫描命中数（2µs）
- *   [21]    组合B 首个命中地址
- *   [22]    组合A 全地址扫描命中数（100µs）
- *   [23]    组合A 慢速首个命中地址
- *   [24]    INT(P1.04) 加内部上拉时的电平
- *   [25]    INT(P1.04) 纯高阻时的电平
+ *   [10]    2µs   probe 0x75，0 = 收到 ACK
+ *   [11]    20µs  probe 0x75，0 = 收到 ACK
+ *   [12]    100µs probe 0x75，0 = 收到 ACK
+ *   [13]    快速全地址扫描命中数
+ *   [14]    快速首个命中地址（7bit）
+ *   [15]    慢速全地址扫描命中数
+ *   [16]    慢速首个命中地址（7bit）
+ *   [17]    INT(P1.04) 纯高阻时的电平
+ *   [18]    INT(P1.04) 加内部上拉时的电平
+ *   [19]    保留
  *
- *   [24] 是判断"芯片进没进 I2C 模式"的关键：
+ *   [18] 是判断"芯片进没进 I2C 模式"的关键：
  *   没进模式时 RSET(21) 只是对地的内阻设定电阻，内部上拉也压不过它 → 读到低；
  *   进了模式后它是芯片的 INT 输出（待机高阻 / 工作高电平）→ 读到高。
  */
 static void ip5328_diag_run(void)
 {
-	uint8_t hits_a[3] = { 0 };
-	uint8_t first_b = 0U;
+	uint8_t first_fast = 0U;
 	uint8_t first_slow = 0U;
-	uint8_t n_a = 0U;
-	uint8_t n_b = 0U;
+	uint8_t n_fast = 0U;
 	uint8_t n_slow = 0U;
 
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	ip5328_diag[1] = (uint8_t)(ip5328_int_level() > 0 ? 1U : 0U);
 
 	/* 先量静态电平，探测本身会扰动总线 */
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	ip5328_diag[2] = (uint8_t)ip_pin_level(IP5328_PIN_M5, 0);
 	ip5328_diag[3] = (uint8_t)ip_pin_level(IP5328_PIN_M6, 0);
 	ip5328_diag[4] = (uint8_t)ip_pin_level(IP5328_PIN_M5, GPIO_PULL_UP);
@@ -835,55 +826,35 @@ static void ip5328_diag_run(void)
 	ip5328_diag[8] = (uint8_t)ip_line_has_pullup(IP5328_PIN_M5);
 	ip5328_diag[9] = (uint8_t)ip_line_has_pullup(IP5328_PIN_M6);
 
-	/* 三级速率各试两个引脚组合，每次先做一次总线恢复 */
+	/* 三级速率各试一次，每次先做一次总线恢复 */
 	ip_i2c_set_delay(IP5328_DELAY_FAST);
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	ip_i2c_bus_recover();
 	ip5328_diag[10] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
-	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
+
+	ip_i2c_set_delay(IP5328_DELAY_MID);
 	ip_i2c_bus_recover();
 	ip5328_diag[11] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
 
-	ip_i2c_set_delay(IP5328_DELAY_MID);
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_set_delay(IP5328_DELAY_SLOW);
 	ip_i2c_bus_recover();
 	ip5328_diag[12] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
-	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
-	ip_i2c_bus_recover();
-	ip5328_diag[13] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
-
-	ip_i2c_set_delay(IP5328_DELAY_SLOW);
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
-	ip_i2c_bus_recover();
-	ip5328_diag[14] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
-	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
-	ip_i2c_bus_recover();
-	ip5328_diag[15] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
 
 	/* 全地址扫一遍：万一从机地址不是 0x75，也能发现 */
 	ip_i2c_set_delay(IP5328_DELAY_FAST);
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
 	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
 		if (ip_i2c_probe(a) == 0) {
-			if (n_a < ARRAY_SIZE(hits_a)) {
-				hits_a[n_a] = a;
+			if (n_fast == 0U) {
+				first_fast = a;
 			}
-			n_a++;
-		}
-	}
-	ip_i2c_bind(IP5328_PIN_M6, IP5328_PIN_M5);
-	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
-		if (ip_i2c_probe(a) == 0) {
-			if (n_b == 0U) {
-				first_b = a;
-			}
-			n_b++;
+			n_fast++;
 		}
 	}
 
 	/* 慢速再扫一遍，万一是从机嫌快 */
 	ip_i2c_set_delay(IP5328_DELAY_SLOW);
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
 	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
 		if (ip_i2c_probe(a) == 0) {
 			if (n_slow == 0U) {
@@ -893,36 +864,29 @@ static void ip5328_diag_run(void)
 		}
 	}
 
-	ip5328_diag[0] = (uint8_t)(1U | (ip5328_diag[10] == 0 ? 0x02U : 0U) |
-				   (ip5328_diag[11] == 0 ? 0x04U : 0U));
-	ip5328_diag[16] = n_a;
-	ip5328_diag[17] = hits_a[0];
-	ip5328_diag[18] = hits_a[1];
-	ip5328_diag[19] = hits_a[2];
-	ip5328_diag[20] = n_b;
-	ip5328_diag[21] = first_b;
-	ip5328_diag[22] = n_slow;
-	ip5328_diag[23] = first_slow;
-
 	/* 哪个速率能通就固定用哪个，免得真正读数据时又失败 */
-	if (ip5328_diag[10] != 0 && ip5328_diag[11] != 0 &&
-	    (ip5328_diag[12] == 0 || ip5328_diag[13] == 0)) {
+	if (ip5328_diag[10] != 0 && ip5328_diag[11] == 0) {
 		ip_i2c_set_delay(IP5328_DELAY_MID);
 	} else if (ip5328_diag[10] != 0 && ip5328_diag[11] != 0 &&
-		   ip5328_diag[14] != 0 && ip5328_diag[15] != 0 && n_slow > 0U) {
+		   ip5328_diag[12] == 0) {
 		ip_i2c_set_delay(IP5328_DELAY_SLOW);
 	} else {
 		ip_i2c_set_delay(IP5328_DELAY_FAST);
 	}
 
 	/* 收摊前看看总线有没有被从机拉死 */
-	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 	ip_i2c_bus_recover();
 	ip_sda_rel();
 	k_busy_wait(50);
-	if (!ip_sda_get()) {
-		ip5328_diag[0] |= 0x08U;
-	}
+
+	ip5328_diag[0] = (uint8_t)(1U | (ip5328_diag[10] == 0 ? 0x02U : 0U) |
+				   (ip5328_diag[11] == 0 ? 0x04U : 0U) |
+				   (ip5328_diag[12] == 0 ? 0x08U : 0U) |
+				   (ip_sda_get() ? 0U : 0x10U));
+	ip5328_diag[13] = n_fast;
+	ip5328_diag[14] = first_fast;
+	ip5328_diag[15] = n_slow;
+	ip5328_diag[16] = first_slow;
 
 	/*
 	 * RSET/INT 的两种读法：
@@ -930,17 +894,17 @@ static void ip5328_diag_run(void)
 	 *   加内部上拉 —— 能压过对地电阻就读高，压不过就读低
 	 * 两者合起来能判断"芯片到底进没进 I2C 模式"。
 	 */
-	ip5328_diag[25] = (uint8_t)ip_pin_level(IP5328_PIN_M7, 0);
-	ip5328_diag[24] = (uint8_t)ip_pin_level(IP5328_PIN_M7, GPIO_PULL_UP);
+	ip5328_diag[17] = (uint8_t)ip_pin_level(IP5328_PIN_M7, 0);
+	ip5328_diag[18] = (uint8_t)ip_pin_level(IP5328_PIN_M7, GPIO_PULL_UP);
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
 
 	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
-		"nak=%u%u/%u%u/%u%u hits=%u,%u,%u stuck=%u",
-		ip5328_diag[1], ip5328_diag[24], ip5328_diag[25], ip5328_diag[2],
+		"nak=%u/%u/%u hits=%u,%u slow=%u,%u",
+		ip5328_diag[1], ip5328_diag[17], ip5328_diag[18], ip5328_diag[2],
 		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
 		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
-		ip5328_diag[11], ip5328_diag[12], ip5328_diag[13], ip5328_diag[14],
-		ip5328_diag[15], n_a, n_b, n_slow, (ip5328_diag[0] >> 3) & 1U);
+		ip5328_diag[11], ip5328_diag[12], n_fast, first_fast, n_slow,
+		first_slow);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
@@ -994,7 +958,7 @@ static int configure_ip5328_io(void)
 		return -ENODEV;
 	}
 
-	/* I2C 两脚先放开，外部 4.7k 上拉到 IP5328 的 VREG */
+	/* I2C 两脚先放开，外部 3.3k 上拉到 IP5328 的 VREG */
 	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
 
 	/* INT：主板醒着为高，平时下拉成确定电平 */
