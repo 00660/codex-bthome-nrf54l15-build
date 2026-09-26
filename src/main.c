@@ -94,6 +94,16 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define OTA_WINDOW_SECONDS 120U
 #define KEY_DEBOUNCE_MS 30
 
+/*
+ * 功能测试模式：不休眠，一直保持可连接广播，数据每 5 秒刷一次，
+ * 这样随时都能连上去看数据，不用等 10 分钟窗口。
+ *
+ * 运行期可以改：手机端把 "Sleep enable" 特征写成 1 就切回正常的
+ * 10 分钟周期，写 0 又回到常醒。量产前把 STAY_AWAKE_DEFAULT 改成 0。
+ */
+#define STAY_AWAKE_DEFAULT 1
+#define TEST_SAMPLE_INTERVAL K_SECONDS(5)
+
 /* ---------------- IP5328 ---------------- */
 
 /* 模组脚号 → P1 引脚号 */
@@ -134,6 +144,8 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 	BT_UUID_128_ENCODE(0x6F6B0300, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 #define APP_VERSION_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0301, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+#define APP_SLEEP_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0302, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
 /* ---------------- GPIO 测试开关 ---------------- */
 
@@ -282,12 +294,16 @@ static const struct bt_uuid_128 ip5328_report_uuid = BT_UUID_INIT_128(IP5328_REP
 static const struct bt_uuid_128 ip5328_diag_uuid = BT_UUID_INIT_128(IP5328_DIAG_UUID_VAL);
 static const struct bt_uuid_128 app_info_service_uuid = BT_UUID_INIT_128(APP_INFO_SERVICE_UUID_VAL);
 static const struct bt_uuid_128 app_version_uuid = BT_UUID_INIT_128(APP_VERSION_UUID_VAL);
+static const struct bt_uuid_128 app_sleep_uuid = BT_UUID_INIT_128(APP_SLEEP_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
 static bool connected;
 static bool vdd_adc_ready;
 static int16_t adc_sample_buffer[2];
+
+/* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
+static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
 
 static uint32_t ip_scl_pin;
 static uint32_t ip_sda_pin;
@@ -1237,6 +1253,45 @@ static ssize_t read_app_version(struct bt_conn *conn, const struct bt_gatt_attr 
 				 strlen(app_version_str));
 }
 
+/* 1 = 允许休眠，0 = 常醒测试模式。随时可写，测完切回休眠不用重新刷机。 */
+static ssize_t read_sleep_enable(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				 void *buf, uint16_t len, uint16_t offset)
+{
+	uint8_t value = sleep_enabled ? 1U : 0U;
+
+	ARG_UNUSED(attr);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &value, sizeof(value));
+}
+
+static ssize_t write_sleep_enable(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				  const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+{
+	uint8_t value;
+
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+	ARG_UNUSED(flags);
+
+	if (offset != 0U) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	if (len != sizeof(value)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	value = *(const uint8_t *)buf;
+	if (value > 1U) {
+		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+
+	sleep_enabled = value != 0U;
+	LOG_INF("sleep_enabled=%u", sleep_enabled);
+
+	return len;
+}
+
 #define GPIO_SWITCH_GATT_ENTRY(index, port_node, pin_number, label) \
 	BT_GATT_CHARACTERISTIC(&gpio_switch_uuid_##index.uuid, \
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE, \
@@ -1280,6 +1335,10 @@ BT_GATT_SERVICE_DEFINE(app_info_service,
 	BT_GATT_CHARACTERISTIC(&app_version_uuid.uuid, BT_GATT_CHRC_READ,
 			       BT_GATT_PERM_READ, read_app_version, NULL, NULL),
 	BT_GATT_CUD("Version", BT_GATT_PERM_READ),
+	BT_GATT_CHARACTERISTIC(&app_sleep_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+			       read_sleep_enable, write_sleep_enable, NULL),
+	BT_GATT_CUD("Sleep enable", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
@@ -1481,11 +1540,21 @@ int main(void)
 		}
 		publish_sensors(&capture, &ip);
 
-		/* OTA 窗口：这段时间可连接广播，电脑端轮询到就能刷机 */
-		advertise_then_stop(K_SECONDS(OTA_WINDOW_SECONDS));
+		if (sleep_enabled) {
+			/* OTA 窗口：这段时间可连接广播，电脑端轮询到就能刷机 */
+			advertise_then_stop(K_SECONDS(OTA_WINDOW_SECONDS));
 
-		LOG_INF("idle, wait up to %d min or KEY (count=%u)", 10, key_wake_count);
-		(void)k_sem_take(&wake_sem, SAMPLE_INTERVAL);
+			LOG_INF("idle, wait up to %d min or KEY (count=%u)", 10,
+				key_wake_count);
+			(void)k_sem_take(&wake_sem, SAMPLE_INTERVAL);
+		} else {
+			/*
+			 * 测试模式：广播不收，一直保持可连接，数据每 5 秒刷一次，
+			 * 按一下键也能立刻刷。想回正常休眠就往 "Sleep enable" 写 1。
+			 */
+			(void)start_advertising();
+			(void)k_sem_take(&wake_sem, TEST_SAMPLE_INTERVAL);
+		}
 
 		/* 按键机械抖动，等电平稳定后再采样 */
 		k_msleep(KEY_DEBOUNCE_MS);
