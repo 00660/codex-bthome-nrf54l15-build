@@ -112,15 +112,24 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 /*
  * 没有 I2C 就读不到 IP5328 的充电标志，只能看电池电压往哪边走。
  *
- * 为什么窗口要 5 分钟：锂电池在 3.7~4.0V 那段曲线很平，
- * 恒流充电时电压每分钟只涨 1~2mV，5 秒 / 1 分钟的窗口全被 ADC 噪声淹掉。
- * 拉到 5 分钟，累积变化能有 5~10mV，才勉强能分辨。
- * 真实使用是 10 分钟一轮，正好够；常醒测试模式下要等满 5 分钟才出第一个状态。
+ * 关键：不能拿两个单点相减。实测电池读数在 4124~4140 mV 之间跳，
+ * 峰峰值 16mV（±8mV），这个噪声自己就能把 8mV 的阈值顶穿，
+ * 于是"没在充电"也被判成 CHARGING。
+ *
+ * 所以改成【窗口平均值比窗口平均值】：窗口内每个采样点都累加，
+ * 到点了取平均再相减。5 分钟按 5 秒一次能攒 60 个点，噪声从 ±6mV
+ * 压到 ±0.8mV 左右，阈值就能降到 5mV 而不会被噪声误触发。
+ *
+ * 阈值为什么是 5mV：锂电池在 3.7~4.0V 那段曲线很平，恒流充电每分钟
+ * 只涨 1~2mV，5 分钟真实涨 5~10mV。低于 5mV 分不出来，高了又抓不住。
+ *
+ * 第一个窗口只用来打基准（这时候状态还是 UNKNOWN），所以开机后要满
+ * 两个窗口才出第一个判断：常醒测试模式约 10 分钟，正常周期则是两轮。
  */
 #define BAT_TREND_WINDOW_MS (5U * 60U * 1000U)
-#define BAT_TREND_MIN_MV 8
-/* 电压已经到这个水平又不再涨，就当充满了 */
-#define BAT_FULL_MV 4150U
+#define BAT_TREND_MIN_MV 5
+/* 电压已经到这个水平又不再涨，就当充满了（静置的锂电 4.1V 以上基本就是满） */
+#define BAT_FULL_MV 4100U
 
 #define BAT_STATE_UNKNOWN 0U     /* 还没攒够一个比较窗口 */
 #define BAT_STATE_IDLE 1U        /* 待机 */
@@ -128,15 +137,22 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BAT_STATE_DISCHARGING 3U /* 放电中 */
 #define BAT_STATE_FULL 4U        /* 已充满 */
 
-/* ---------------- 充电器输入 VBUS（可选接线） ---------------- */
+/* ---------------- 充电器输入 VBUS（可选接线，默认关） ---------------- */
 
 /*
- * 模组第 16 脚 = P1.07 = AIN3。
- * 接法：VBUS ──[1MΩ]──┬── 模组 16 脚；└──[150kΩ]── GND（分压约 7.67:1）
- * 5V → 0.65V，20V → 2.61V，都在 ADC 满量程内。
- * 只要分压后超过 250mV（≈ 输入 1.9V）就认为插着充电器。
- * 没接线时这一脚悬空，读数落不进来，就当"没插"。
+ * 模组第 16 脚 = P1.07 = AIN3，接法（要用的时候才接）：
+ *
+ *   VBUS ──[1MΩ]──┬── 模组 16 脚
+ *                 └──[150kΩ]── GND        分压约 7.67:1
+ *
+ * 5V → 0.65V，9V → 1.17V，12V → 1.56V，20V → 2.61V，都在满量程内。
+ *
+ * ★ 现在置 0：这一脚【悬空】，什么都没接。
+ *   悬空脚的 ADC 读数会乱飘（实测报到 3335mV，按 7.67:1 反推输入端
+ *   是 25.6V，根本不可能），会被当成"插着充电器"，纯属误导。
+ *   接上分压之后再改成 1。
  */
+#define VBUS_ADC_ENABLE 0
 #define VBUS_ADC_MIN_PRESENT_MV 250U
 
 #define BATTERY_FULL_MV 3000U
@@ -407,10 +423,15 @@ static int16_t adc_sample_buffer[2];
 /* 最近一次 ADC 兜底测到的电池电压（mV）—— 电量百分比的查表在下面，先声明 */
 static uint8_t battery_percent_from_mv(uint16_t mv);
 
-/* 充电状态推断用的基准点：上一次比较时的电压和时刻 */
-static uint16_t bat_trend_mv;
-static int64_t bat_trend_ms;
-static bool bat_trend_valid;
+/*
+ * 充电状态推断：一个窗口内把每个采样点都累加，到点取平均再和上一个
+ * 窗口的平均值比。单点比单点会被 ±8mV 的噪声顶穿，见上面的注释。
+ */
+static uint32_t bat_trend_sum;
+static uint16_t bat_trend_count;
+static uint16_t bat_trend_avg;   /* 上一个窗口的平均值 */
+static int64_t bat_trend_ms;     /* 上一个窗口结束的时刻 */
+static bool bat_trend_valid;     /* 是否已经打过基准 */
 static uint8_t bat_charge_state = BAT_STATE_UNKNOWN;
 
 /* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
@@ -1499,11 +1520,11 @@ static int configure_adc(void)
 		LOG_WRN("Battery ADC (模组 4 脚 / P1.12 / AIN5) 不可用，电池电压只能靠 IP5328");
 	}
 
-	/* 充电器输入 VBUS，同样"能用就更好" */
+	/* 充电器输入 VBUS —— 这一路默认关掉，见 VBUS_ADC_ENABLE */
 	vbus_adc_ready = false;
-	if (adc_is_ready_dt(&vbus_adc) && adc_channel_setup_dt(&vbus_adc) == 0) {
+	if (VBUS_ADC_ENABLE && adc_is_ready_dt(&vbus_adc) && adc_channel_setup_dt(&vbus_adc) == 0) {
 		vbus_adc_ready = true;
-	} else {
+	} else if (VBUS_ADC_ENABLE) {
 		LOG_WRN("VBUS ADC (模组 16 脚 / P1.07 / AIN3) 不可用，充电器插入检测关闭");
 	}
 
@@ -1580,50 +1601,55 @@ static uint32_t ntc_resistance_ohms(uint32_t adc_mv, uint32_t vdd_mv)
 /*
  * 由电池电压的变化方向推断充电状态。
  *
- * 每攒够 BAT_TREND_WINDOW_MS 才比较一次：拿当前电压和上次比较时的电压相减，
- * 涨够 BAT_TREND_MIN_MV 就算充电，跌够就算放电，都不够就看绝对电压：
- * 已经到 BAT_FULL_MV 以上又不动 → 充满，否则 → 待机。
+ * 每个采样点都累加进当前窗口；攒够 BAT_TREND_WINDOW_MS 就取平均值，
+ * 和上一个窗口的平均值相减。涨够 BAT_TREND_MIN_MV 算充电，跌够算放电，
+ * 都不够就看绝对电压：到 BAT_FULL_MV 以上又不动 → 充满，否则 → 待机。
  *
- * 窗口没到就直接返回，所以刚开机那 5 分钟状态是 UNKNOWN（0）。
+ * 第一个窗口只用来打基准，所以第一次判断要等两个窗口。
  */
 static void bat_update_charge_state(uint16_t mv)
 {
 	int64_t now;
+	uint16_t avg;
 
 	if (mv == 0U) {
 		return; /* 分压没接，不猜 */
 	}
 
+	bat_trend_sum += mv;
+	bat_trend_count++;
+
 	now = k_uptime_get();
+	if (now - bat_trend_ms < (int64_t)BAT_TREND_WINDOW_MS) {
+		return; /* 窗口还没到，继续攒 */
+	}
+
+	avg = (uint16_t)(bat_trend_sum / bat_trend_count);
 
 	if (!bat_trend_valid) {
-		bat_trend_mv = mv;
-		bat_trend_ms = now;
+		/* 第一个窗口只打基准，状态保持 UNKNOWN */
 		bat_trend_valid = true;
-		return;
-	}
-
-	if (now - bat_trend_ms < (int64_t)BAT_TREND_WINDOW_MS) {
-		return; /* 窗口还没到，继续等 */
-	}
-
-	int delta = (int)mv - (int)bat_trend_mv;
-
-	if (delta >= BAT_TREND_MIN_MV) {
-		bat_charge_state = BAT_STATE_CHARGING;
-	} else if (delta <= -BAT_TREND_MIN_MV) {
-		bat_charge_state = BAT_STATE_DISCHARGING;
-	} else if (mv >= BAT_FULL_MV) {
-		bat_charge_state = BAT_STATE_FULL;
 	} else {
-		bat_charge_state = BAT_STATE_IDLE;
+		int delta = (int)avg - (int)bat_trend_avg;
+
+		if (delta >= BAT_TREND_MIN_MV) {
+			bat_charge_state = BAT_STATE_CHARGING;
+		} else if (delta <= -BAT_TREND_MIN_MV) {
+			bat_charge_state = BAT_STATE_DISCHARGING;
+		} else if (avg >= BAT_FULL_MV) {
+			bat_charge_state = BAT_STATE_FULL;
+		} else {
+			bat_charge_state = BAT_STATE_IDLE;
+		}
+
+		LOG_INF("charge state -> %u (avg %u -> %u mV, delta=%d, %u samples)",
+			bat_charge_state, bat_trend_avg, avg, delta, bat_trend_count);
 	}
 
-	bat_trend_mv = mv;
+	bat_trend_avg = avg;
 	bat_trend_ms = now;
-
-	LOG_INF("charge state -> %u (delta=%d mV over %u ms, v=%u mV)", bat_charge_state, delta,
-		(uint32_t)BAT_TREND_WINDOW_MS, mv);
+	bat_trend_sum = 0U;
+	bat_trend_count = 0U;
 }
 
 static int sample_ntc(struct ntc_capture *capture)
