@@ -1,22 +1,22 @@
 /*
- * nRF54L15 / E73-2G4M08S1F  BTHome 传感器固件（NTC + IP5328 + OTA）
+ * nRF54L15 / E73-2G4M08S1F  BTHome 传感器固件（NTC + 电池 ADC + OTA）
  * ---------------------------------------------------------------------
- * 传感器
- *   1. 100k NTC 分压测温（P1.10 供电 / P1.11 AIN4 采样）
- *   2. 电池电压 ADC 兜底（模组 4 脚 = P1.12 AIN5，外部 1:1 分压）
- *   3. IP5328 移动电源 SOC 的 I2C 数据（电池电压/电流/功率/充电状态/电量）
- *      —— 软件 bit-bang I2C 挂在 P1.13 / P1.14，接线顺序写死：
- *         模组 5 脚 = SCL，模组 6 脚 = SDA
- *      I2C 通了就用 IP5328 的 14bit ADC 数据，不通就用上面那路 ADC 兜底。
+ * 传感器（纯 ADC 路线，不用 I2C）
+ *   1. 100k NTC 分压测温（模组 2 脚供电 / 模组 3 脚 = P1.11 AIN4 采样）
+ *   2. 电池电压（模组 4 脚 = P1.12 AIN5，外部 1:1 分压）
+ *   3. 充电器输入 VBUS（模组 16 脚 = P1.07 AIN3，可选接线）
+ *   4. 充电状态：由电池电压的变化方向推断（没有 I2C 时的唯一办法）
+ *
+ * IP5328 的 I2C 那套（模组 5/6/7 脚）代码还在，但默认关掉了 ——
+ * 见 IP5328_I2C_ENABLE。关掉之后开机不用等 30 秒静默期、不跑总线诊断，
+ * P1.13 / P1.14 / P1.04 都保持高阻。
  *
  * 引脚（E73 模组脚 → nRF54L15）
+ *   2  → P1.10   NTC 分压供电（只在采样时给电）
+ *   3  → P1.11   电池/NTC ADC (AIN4)
  *   4  → P1.12   电池电压 ADC (AIN5)，外部分压
- *   5  → P1.13   IP5328 I2C SCL
- *   6  → P1.14   IP5328 I2C SDA
- *   7  → P1.04   IP5328 INT/RSET 状态输入（高 = 主板醒着）
- *   8  → P1.02   IP5328 KEY 网络（NFC1，overlay 里已关 NFC）—— 也能主动拉低当按键用
- *   10 → P1.10   NTC 分压供电
- *   11 → P1.11   NTC ADC (AIN4)
+ *   8  → P1.02   IP5328 KEY 网络（NFC1，overlay 里已关 NFC）—— 按键唤醒
+ *   16 → P1.07   充电器输入 VBUS ADC (AIN3)，外部分压（可选）
  *
  * 运行策略（双唤醒 + 轮询 OTA 窗口）
  *   唤醒源 1：定时，每 10 分钟一轮（原机制，保留）
@@ -107,6 +107,38 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BAT_ADC_MIN_VALID_MV 1500U
 #define BAT_ADC_MAX_VALID_MV 5000U
 
+/* ---------------- 充电状态（纯 ADC 推断） ---------------- */
+
+/*
+ * 没有 I2C 就读不到 IP5328 的充电标志，只能看电池电压往哪边走。
+ *
+ * 为什么窗口要 5 分钟：锂电池在 3.7~4.0V 那段曲线很平，
+ * 恒流充电时电压每分钟只涨 1~2mV，5 秒 / 1 分钟的窗口全被 ADC 噪声淹掉。
+ * 拉到 5 分钟，累积变化能有 5~10mV，才勉强能分辨。
+ * 真实使用是 10 分钟一轮，正好够；常醒测试模式下要等满 5 分钟才出第一个状态。
+ */
+#define BAT_TREND_WINDOW_MS (5U * 60U * 1000U)
+#define BAT_TREND_MIN_MV 8
+/* 电压已经到这个水平又不再涨，就当充满了 */
+#define BAT_FULL_MV 4150U
+
+#define BAT_STATE_UNKNOWN 0U     /* 还没攒够一个比较窗口 */
+#define BAT_STATE_IDLE 1U        /* 待机 */
+#define BAT_STATE_CHARGING 2U    /* 充电中 */
+#define BAT_STATE_DISCHARGING 3U /* 放电中 */
+#define BAT_STATE_FULL 4U        /* 已充满 */
+
+/* ---------------- 充电器输入 VBUS（可选接线） ---------------- */
+
+/*
+ * 模组第 16 脚 = P1.07 = AIN3。
+ * 接法：VBUS ──[1MΩ]──┬── 模组 16 脚；└──[150kΩ]── GND（分压约 7.67:1）
+ * 5V → 0.65V，20V → 2.61V，都在 ADC 满量程内。
+ * 只要分压后超过 250mV（≈ 输入 1.9V）就认为插着充电器。
+ * 没接线时这一脚悬空，读数落不进来，就当"没插"。
+ */
+#define VBUS_ADC_MIN_PRESENT_MV 250U
+
 #define BATTERY_FULL_MV 3000U
 #define BATTERY_EMPTY_MV 2200U
 
@@ -133,12 +165,27 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define TEST_SAMPLE_INTERVAL K_SECONDS(5)
 
 /*
+ * ================== IP5328 I2C：默认关闭 ==================
+ *
+ * 板子上那三根 I2C 线（模组 5/6/7 脚）已经拆掉，改走纯 ADC 了。
+ * 置 0 就完全不碰 I2C：
+ *   - 不探测、不跑总线诊断、不按键
+ *   - 开机不用再等 30 秒静默期
+ *   - P1.13 / P1.14 / P1.04 全部保持高阻
+ *
+ * 代码全都留着，哪天把线接回去（并且确认上拉挂在 IP5328 第 27 脚 VREG 上），
+ * 把这里改成 1 就恢复。
+ */
+#define IP5328_I2C_ENABLE 0
+
+/*
  * 开机后先安静这么久，一个字节都不碰 I2C 两脚。
  * IP5328 是在【上电那一刻】检测这两脚为高才进 I2C 模式的，
  * 我们一上电就探测、拉低、扫描，会把它的检测过程搅掉 ——
  * 它一旦没进模式，之后怎么读都不会应答。
+ * I2C 关掉时不需要这个静默期。
  */
-#define IP5328_QUIET_BOOT_MS 30000
+#define IP5328_QUIET_BOOT_MS (IP5328_I2C_ENABLE ? 30000 : 0)
 
 /* ---------------- IP5328 ---------------- */
 
@@ -246,6 +293,10 @@ struct ntc_capture {
 	/* 模组第 4 脚 (P1.12/AIN5) 分压后测到的电池电压，已换算回 BAT 端 */
 	uint16_t bat_mv;
 	uint16_t bat_raw_mv;
+	/* 模组第 16 脚 (P1.07/AIN3) 分压后测到的充电器输入电压（未换算回 VBUS 端） */
+	uint16_t vbus_mv;
+	/* 充电状态，见 BAT_STATE_* */
+	uint8_t charge_state;
 };
 
 struct soc_point {
@@ -315,6 +366,7 @@ static const struct soc_point soc_table[] = {
 static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
 static const struct adc_dt_spec vdd_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
 static const struct adc_dt_spec bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 2);
+static const struct adc_dt_spec vbus_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 3);
 static const struct gpio_dt_spec ntc_power = GPIO_DT_SPEC_GET(DT_ALIAS(ntcpower), gpios);
 static const struct device *const ip_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
@@ -349,10 +401,17 @@ BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 static bool connected;
 static bool vdd_adc_ready;
 static bool bat_adc_ready;
+static bool vbus_adc_ready;
 static int16_t adc_sample_buffer[2];
 
-/* 最近一次 ADC 兜底测到的电池电压（mV），给 IP5328 报告特征兜底用 */
-static uint16_t bat_adc_mv;
+/* 最近一次 ADC 兜底测到的电池电压（mV）—— 电量百分比的查表在下面，先声明 */
+static uint8_t battery_percent_from_mv(uint16_t mv);
+
+/* 充电状态推断用的基准点：上一次比较时的电压和时刻 */
+static uint16_t bat_trend_mv;
+static int64_t bat_trend_ms;
+static bool bat_trend_valid;
+static uint8_t bat_charge_state = BAT_STATE_UNKNOWN;
 
 /* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
 static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
@@ -1027,6 +1086,15 @@ static void ip5328_diag_run(void)
 	uint8_t unused_high = 0U;
 
 	/*
+	 * 纯 ADC 模式：I2C 线拆了，诊断没意义。
+	 * 整包填 0xFF 当"未测"标记，免得读的人把全 0 误当成"测过但什么也没发生"。
+	 */
+	if (!IP5328_I2C_ENABLE) {
+		memset(ip5328_diag, 0xFF, sizeof(ip5328_diag));
+		return;
+	}
+
+	/*
 	 * 第一件事：别碰总线，先听。
 	 * 后面所有探测都会往线上打时钟，只有现在能听到"线上本来在发生什么"。
 	 */
@@ -1232,6 +1300,15 @@ static int ip5328_sample(struct ip5328_data *d)
 		.bind = ip_bind,
 	};
 
+	/*
+	 * 纯 ADC 模式：I2C 线已经拆了，直接返回失败。
+	 * d->valid 保持 0，上层就会用电池 ADC 的数据。
+	 */
+	if (!IP5328_I2C_ENABLE) {
+		d->error = -ENOTSUP;
+		return -ENOTSUP;
+	}
+
 	ret = ip5328_ensure_bind();
 	if (ret) {
 		d->error = (int8_t)ret;
@@ -1253,20 +1330,37 @@ static int ip5328_sample(struct ip5328_data *d)
 	return -EIO;
 }
 
-static void ip5328_encode_report(const struct ip5328_data *d)
+static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_capture *ntc)
 {
-	if (!d->valid && bat_adc_mv > 0U) {
+	if (!d->valid) {
 		/*
-		 * I2C 读不通，但模组第 4 脚的电池分压是活的。
-		 * 这一格就改报 ADC 实测的电池电压，方便现场验收（不用看串口日志）。
+		 * 纯 ADC 模式（I2C 关了，或者读失败）：这一格改报 ADC 实测的数据，
+		 * 方便现场验收，不用看串口日志。
+		 *
+		 *   [0]     0xFE = 本包是 ADC 数据
+		 *   [1]     bit0~2 充电状态，bit4 充电中，bit6 已充满（沿用原来的位语义）
+		 *   [2]     bit0~2 同上，方便只读一个字节的人
+		 *   [3]     电量 %
+		 *   [4:6]   电池电压 mV（分压换算回 BAT 端）
+		 *   [6:8]   分压后、换算前的原始 mV（1:1 分压时是电池电压的一半）
+		 *   [8:10]  充电器输入 VBUS 分压后的 mV，0 = 没插
+		 *   [10:12] 充电状态（和 [1] bit0~2 同值）
 		 */
 		memset(ip5328_report, 0, sizeof(ip5328_report));
 		ip5328_report[0] = IP5328_REPORT_ADC_FALLBACK;
-		sys_put_le16(bat_adc_mv, &ip5328_report[4]);
+		ip5328_report[1] = (uint8_t)((ntc->charge_state & 0x07U) |
+					     (ntc->charge_state == BAT_STATE_CHARGING ? 0x10U : 0U) |
+					     (ntc->charge_state == BAT_STATE_FULL ? 0x40U : 0U));
+		ip5328_report[2] = (uint8_t)(ntc->charge_state & 0x07U);
+		ip5328_report[3] = battery_percent_from_mv(ntc->bat_mv);
+		sys_put_le16(ntc->bat_mv, &ip5328_report[4]);
+		sys_put_le16(ntc->bat_raw_mv, &ip5328_report[6]);
+		sys_put_le16(ntc->vbus_mv, &ip5328_report[8]);
+		sys_put_le16(ntc->charge_state, &ip5328_report[10]);
 		return;
 	}
 
-	ip5328_report[0] = d->valid ? (uint8_t)(IP5328_REPORT_OK_BASE + d->bind) : 0U;
+	ip5328_report[0] = (uint8_t)(IP5328_REPORT_OK_BASE + d->bind);
 	ip5328_report[1] = (uint8_t)((d->sys_state & 0x07U) | (d->charging ? 0x10U : 0U) |
 				     (d->full ? 0x40U : 0U));
 	ip5328_report[2] = (uint8_t)(d->charge_stage & 0x07U);
@@ -1284,6 +1378,19 @@ static int configure_ip5328_io(void)
 	if (!device_is_ready(ip_port)) {
 		LOG_ERR("gpio1 is not ready");
 		return -ENODEV;
+	}
+
+	if (!IP5328_I2C_ENABLE) {
+		/*
+		 * 纯 ADC 模式：I2C 三根线（模组 5/6/7 脚）已经拆掉。
+		 * 这三脚全部配成纯高阻，不驱动、不加上拉，免得悬空脚互相漏电。
+		 * P1.02（模组 8 脚，KEY 唤醒）在 configure_key_wakeup() 里配，那个还要用。
+		 */
+		(void)gpio_pin_configure(ip_port, IP5328_PIN_M5, GPIO_INPUT);
+		(void)gpio_pin_configure(ip_port, IP5328_PIN_M6, GPIO_INPUT);
+		(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT);
+		(void)gpio_pin_configure(ip_port, IP5328_PIN_NFC2, GPIO_INPUT);
+		return 0;
 	}
 
 	/* I2C 两脚先放开，外部 3.3k 上拉到 IP5328 的 VREG */
@@ -1392,6 +1499,14 @@ static int configure_adc(void)
 		LOG_WRN("Battery ADC (模组 4 脚 / P1.12 / AIN5) 不可用，电池电压只能靠 IP5328");
 	}
 
+	/* 充电器输入 VBUS，同样"能用就更好" */
+	vbus_adc_ready = false;
+	if (adc_is_ready_dt(&vbus_adc) && adc_channel_setup_dt(&vbus_adc) == 0) {
+		vbus_adc_ready = true;
+	} else {
+		LOG_WRN("VBUS ADC (模组 16 脚 / P1.07 / AIN3) 不可用，充电器插入检测关闭");
+	}
+
 	return 0;
 }
 
@@ -1462,17 +1577,69 @@ static uint32_t ntc_resistance_ohms(uint32_t adc_mv, uint32_t vdd_mv)
 	return (uint32_t)(((uint64_t)NTC_REF_OHMS * adc_mv + denominator / 2U) / denominator);
 }
 
+/*
+ * 由电池电压的变化方向推断充电状态。
+ *
+ * 每攒够 BAT_TREND_WINDOW_MS 才比较一次：拿当前电压和上次比较时的电压相减，
+ * 涨够 BAT_TREND_MIN_MV 就算充电，跌够就算放电，都不够就看绝对电压：
+ * 已经到 BAT_FULL_MV 以上又不动 → 充满，否则 → 待机。
+ *
+ * 窗口没到就直接返回，所以刚开机那 5 分钟状态是 UNKNOWN（0）。
+ */
+static void bat_update_charge_state(uint16_t mv)
+{
+	int64_t now;
+
+	if (mv == 0U) {
+		return; /* 分压没接，不猜 */
+	}
+
+	now = k_uptime_get();
+
+	if (!bat_trend_valid) {
+		bat_trend_mv = mv;
+		bat_trend_ms = now;
+		bat_trend_valid = true;
+		return;
+	}
+
+	if (now - bat_trend_ms < (int64_t)BAT_TREND_WINDOW_MS) {
+		return; /* 窗口还没到，继续等 */
+	}
+
+	int delta = (int)mv - (int)bat_trend_mv;
+
+	if (delta >= BAT_TREND_MIN_MV) {
+		bat_charge_state = BAT_STATE_CHARGING;
+	} else if (delta <= -BAT_TREND_MIN_MV) {
+		bat_charge_state = BAT_STATE_DISCHARGING;
+	} else if (mv >= BAT_FULL_MV) {
+		bat_charge_state = BAT_STATE_FULL;
+	} else {
+		bat_charge_state = BAT_STATE_IDLE;
+	}
+
+	bat_trend_mv = mv;
+	bat_trend_ms = now;
+
+	LOG_INF("charge state -> %u (delta=%d mV over %u ms, v=%u mV)", bat_charge_state, delta,
+		(uint32_t)BAT_TREND_WINDOW_MS, mv);
+}
+
 static int sample_ntc(struct ntc_capture *capture)
 {
 	uint32_t adc_sum = 0;
 	uint32_t vdd_sum = 0;
 	uint32_t bat_sum = 0;
+	uint32_t vbus_sum = 0;
 	uint16_t bat_count = 0;
+	uint16_t vbus_count = 0;
 	uint16_t adc_min = UINT16_MAX;
 	uint16_t adc_max = 0;
 	int32_t adc_mv;
 	int32_t vdd_mv;
 	int32_t bat_mv;
+	int32_t vbus_mv;
 	int last_error = -EIO;
 	int ret;
 
@@ -1513,6 +1680,14 @@ static int sample_ntc(struct ntc_capture *capture)
 			}
 		}
 
+		if (vbus_adc_ready) {
+			ret = read_adc_mv(&vbus_adc, &vbus_mv);
+			if (ret == 0) {
+				vbus_sum += (uint32_t)CLAMP(vbus_mv, 0, UINT16_MAX);
+				vbus_count++;
+			}
+		}
+
 		adc_mv = CLAMP(adc_mv, 0, UINT16_MAX);
 		vdd_mv = CLAMP(vdd_mv, 0, UINT16_MAX);
 		adc_sum += (uint32_t)adc_mv;
@@ -1550,7 +1725,16 @@ static int sample_ntc(struct ntc_capture *capture)
 		}
 	}
 
-	bat_adc_mv = capture->bat_mv;
+	/* 充电器输入：分压后的值，够高就说明插着充电器，否则报 0（悬空 / 没插） */
+	if (vbus_count > 0U) {
+		capture->vbus_mv = (uint16_t)(vbus_sum / vbus_count);
+		if (capture->vbus_mv < VBUS_ADC_MIN_PRESENT_MV) {
+			capture->vbus_mv = 0U;
+		}
+	}
+
+	bat_update_charge_state(capture->bat_mv);
+	capture->charge_state = bat_charge_state;
 
 	return 0;
 }
@@ -1595,12 +1779,13 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	bthome_service_data[BTHOME_VERSION_OFFSET + 2U] = APP_VERSION_MAJOR;
 	put_s16_le(&bthome_service_data[BTHOME_CURRENT_OFFSET], ip->valid ? ip->bat_ma : 0);
 
-	ip5328_encode_report(ip);
+	ip5328_encode_report(ip, ntc);
 
 	LOG_INF("temp=%d.%02dC ntc=%uohm adc=%umV vdd=%umV samples=%u", ntc->temp_centi / 100,
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
+	LOG_INF("vbus=%umV charge_state=%u", ntc->vbus_mv, ntc->charge_state);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
