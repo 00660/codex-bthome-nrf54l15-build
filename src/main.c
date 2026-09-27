@@ -5,7 +5,8 @@
  *   1. 100k NTC 分压测温（模组 2 脚供电 / 模组 3 脚 = P1.11 AIN4 采样）
  *   2. 电池电压（模组 4 脚 = P1.12 AIN5，外部 1M+1M 分压）
  *   3. 充电器输入 VBUS（模组 6 脚 = P1.14 AIN7，外部 1M+100k 分压）
- *      —— 充电状态的可靠依据，插拔立刻就能判出来
+ *      —— 快充已砍掉，输入只有普通 5V。6 脚反算回输入端的电压
+ *         > 3.6V 且 < 5V 才算插着充电器（没插 ≈3.59V，插着 ≈4.60V）
  *   4. 充电状态：VBUS 为主，电池电压斜率兜底
  *
  * IP5328 的 I2C 那套（模组 5/6/7 脚）代码还在，但默认关掉了 ——
@@ -246,33 +247,24 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 /* ---------------- 充电器输入 VBUS（充电状态的可靠来源） ---------------- */
 
 /*
- * 模组第 6 脚 = P1.14 = AIN7。这是判断"插没插充电器"最靠谱的一路 ——
- * 直接看充电输入有没有电，是数字信号，不用猜。
+ * 模组第 6 脚 = P1.14 = AIN7，外部 1M+100k 分压（约 11:1）。
  *
- *   充电输入 5V ──[1MΩ]──┬── 模组第 6 脚 (P1.14/AIN7)
- *   （或 VIN(30) 脚、USB 口的 5V）└──[100kΩ]── GND     分压约 11:1
- *                                  （再并一颗电容到 GND）
+ *   充电输入 ──[1MΩ]──┬── 模组第 6 脚 (P1.14/AIN7)
+ *                     └──[100kΩ]── GND      （再并一颗电容到 GND）
  *
- * 11:1 下的换算：5V → 0.45V，9V → 0.82V，12V → 1.09V，20V → 1.82V，
- * 全部落在 SAADC 满量程（3.6V）内，余量很大。
+ * 快充砍掉之后输入只可能是普通 5V，实测这一脚就两个状态：
  *
- * 为什么用 6 脚：模组 5/6/7 三个模拟脚现在都空着（5/6 原来是 I2C，
- * 7 原来是 IP5328 的 INT）。6 脚就在已焊好的 4 脚（电池）旁边，接线最顺手。
- * 16 脚当初只是因为 5/6/7 都被占了才选的，现在没必要。
+ *   插着充电器 ≈ 418mV（反算 4.60V）
+ *   没插       ≈ 327mV（反算 3.59V）
  *
- * ★ 现在置 1：接上分压就能用。
- *   拔掉充电器时这一脚被 100k 拉到地（0V），接上就是 0.45V 以上。
- *   即便如此，下面还是留两道闸门防意外（线没接/虚焊时脚会飘）：
- *     ① 读数必须落在 [250mV, 2800mV] 区间内
- *     ② 一个采样窗口内最大最小值之差不能超过 30mV（真 VBUS 很稳，悬空脚会飘）
- *   两道都过才算"插着充电器"，否则报 0。这样即使线没接也不会误报。
+ * 判定规则：反算回输入端的电压 **> 3.6V 且 < 5V** 才算插着充电器。
+ *   低于 3.6V → 没插；高于 5V → 读数不可信（悬空脚乱飘），一样不算。
+ * 原来那套 [250mV, 2800mV] 原始区间 + 30mV 抖动闸门是为了兼容 9/12/20V
+ * 快充档位、以及防悬空脚乱飘，现在都不需要了。
  */
 #define VBUS_ADC_ENABLE 1
-#define VBUS_ADC_MIN_PRESENT_MV 250U
-/* 11:1 下 2800mV 对应输入 30.8V，比任何合法快充档位都高，够宽松了 */
-#define VBUS_ADC_MAX_PLAUSIBLE_MV 2800U
-/* 窗口内跳动超过这么多就认定是悬空脚在飘，不是真 VBUS */
-#define VBUS_ADC_MAX_RIPPLE_MV 30U
+#define VBUS_PRESENT_MIN_MV 3600U
+#define VBUS_PRESENT_MAX_MV 5000U
 
 /*
  * 分压比，用来把 ADC 读到的分压值**反算回输入端真实电压**，
@@ -280,12 +272,11 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  *
  *   VIN = 分压读数 × (1M + 100k) / 100k = 读数 × 11
  *
- * 实测：USB 5V 输入读 466mV → 466 × 11 = 5126mV。略高于 5V 是正常的
- * （线损、电阻误差、USB 口实际输出 5.1V 左右）。
+ * 实测：插着充电器读 418mV → 418 × 11 = 4598mV。
  *
  * 注意：这个反算值精度有限 —— 1M 和 100k 本身有 1% 误差，合起来约 2%，
  * 在 5V 上有 ±100mV 的不确定度。所以它适合"看个大概"，不能当万用表。
- * 只有通过了上面两道闸门（确认真的插着充电器）时才反算。
+ * 只有判为"插着充电器"时才反算。
  */
 #define VBUS_DIVIDER_NUM 11U
 #define VBUS_DIVIDER_DEN 1U
@@ -410,17 +401,6 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 	BT_UUID_128_ENCODE(0x6F6B0303, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 #define APP_VBUS_DIV_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0304, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
-
-/*
- * 6F6B0305 = 模组 6 脚 / 7 脚原始 ADC 读数，只读，uint16 小端 ×2：
- *   [0:2] 模组第 6 脚 (P1.14 / AIN7) 分压点原始 mV —— 充电输入那一路
- *   [2:4] 模组第 7 脚 (P1.04 / AIN0) 分压点原始 mV —— 纯诊断
- *
- * 两个都是"未经分压比换算"的原始值。分压线焊在哪个脚上，哪一路就有正经读数；
- * 悬空的脚会飘（跳变大、值不稳定）。
- */
-#define APP_PIN_SCAN_UUID_VAL \
-	BT_UUID_128_ENCODE(0x6F6B0305, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
 /* ---------------- GPIO 测试开关 ---------------- */
 
@@ -561,11 +541,6 @@ static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_
 static const struct adc_dt_spec vdd_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
 static const struct adc_dt_spec bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 2);
 static const struct adc_dt_spec vbus_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 3);
-/*
- * 诊断通道：模组第 7 脚 = P1.04 = AIN0。
- * 只用来和模组第 6 脚（AIN7）对比，看不经任何换算的原始分压读数。
- */
-static const struct adc_dt_spec m7_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 4);
 static const struct gpio_dt_spec ntc_power = GPIO_DT_SPEC_GET(DT_ALIAS(ntcpower), gpios);
 static const struct device *const ip_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
@@ -596,7 +571,6 @@ static const struct bt_uuid_128 app_version_uuid = BT_UUID_INIT_128(APP_VERSION_
 static const struct bt_uuid_128 app_sleep_uuid = BT_UUID_INIT_128(APP_SLEEP_UUID_VAL);
 static const struct bt_uuid_128 app_bat_div_uuid = BT_UUID_INIT_128(APP_BAT_DIV_UUID_VAL);
 static const struct bt_uuid_128 app_vbus_div_uuid = BT_UUID_INIT_128(APP_VBUS_DIV_UUID_VAL);
-static const struct bt_uuid_128 app_pin_scan_uuid = BT_UUID_INIT_128(APP_PIN_SCAN_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
@@ -604,11 +578,6 @@ static bool connected;
 static bool vdd_adc_ready;
 static bool bat_adc_ready;
 static bool vbus_adc_ready;
-static bool m7_adc_ready;
-
-/* 模组 6 脚 / 7 脚分压点原始 mV（诊断用，未换算回输入端） */
-static uint16_t m6_raw_mv;
-static uint16_t m7_raw_mv;
 static int16_t adc_sample_buffer[2];
 
 /* 电池电压(mV) → 电量百分比，查 soc_table[] 放电曲线。实现在下面 */
@@ -1731,11 +1700,6 @@ static int configure_io(void)
 	return 0;
 }
 
-static bool setup_optional_adc(const struct adc_dt_spec *spec)
-{
-	return adc_is_ready_dt(spec) && adc_channel_setup_dt(spec) == 0;
-}
-
 static int configure_adc(void)
 {
 	int ret;
@@ -1774,15 +1738,6 @@ static int configure_adc(void)
 		bat_adc_ready = true;
 	} else {
 		LOG_WRN("Battery ADC (模组 4 脚 / P1.12 / AIN5) 不可用，电池电压只能靠 IP5328");
-	}
-
-	/*
-	 * ★ 诊断：模组第 7 脚 = P1.04 = AIN0。
-	 *   失败只告警（这个脚可能什么都没接），绝不影响正常功能。
-	 */
-	m7_adc_ready = setup_optional_adc(&m7_adc);
-	if (!m7_adc_ready) {
-		LOG_WRN("模组 7 脚 (P1.04 / AIN0) 诊断通道不可用");
 	}
 
 	/* 充电器输入 VBUS —— 充电状态的主要依据，见 VBUS_ADC_ENABLE */
@@ -1971,8 +1926,6 @@ static int sample_ntc(struct ntc_capture *capture)
 	uint32_t vdd_sum = 0;
 	uint32_t vbus_sum = 0;
 	uint16_t vbus_count = 0;
-	uint16_t vbus_min = UINT16_MAX;
-	uint16_t vbus_max = 0;
 	uint16_t adc_min = UINT16_MAX;
 	uint16_t adc_max = 0;
 	int32_t adc_mv;
@@ -1993,8 +1946,7 @@ static int sample_ntc(struct ntc_capture *capture)
 	 * 中值（排序取中间那个）对少数离群点天然免疫：只要异常次数不到一半，
 	 * 结果完全不受影响。8 个样本用插入排序，代码几行就够。
 	 *
-	 * VBUS 不用这套 —— 它有 min/max/ripple 三道闸门，本来就靠"跳动量"
-	 * 判断是不是悬空脚，取中值反而会把它的闸门逻辑搞乱。
+	 * VBUS 不用这套 —— 它就一条阈值线，插着/没插差着 90mV，取平均就够稳。
 	 */
 	uint16_t bat_samples[NTC_SAMPLE_COUNT];
 	uint16_t bat_count = 0;
@@ -2037,23 +1989,11 @@ static int sample_ntc(struct ntc_capture *capture)
 			}
 		}
 
-		if (m7_adc_ready) {
-			int32_t m7mv;
-
-			if (read_adc_mv(&m7_adc, &m7mv) == 0) {
-				m7_raw_mv = (uint16_t)CLAMP(m7mv, 0, UINT16_MAX);
-			}
-		}
-
 		if (vbus_adc_ready) {
 			ret = read_adc_mv(&vbus_adc, &vbus_mv);
 			if (ret == 0) {
-				uint16_t v = (uint16_t)CLAMP(vbus_mv, 0, UINT16_MAX);
-
-				vbus_sum += v;
+				vbus_sum += (uint16_t)CLAMP(vbus_mv, 0, UINT16_MAX);
 				vbus_count++;
-				vbus_min = MIN(vbus_min, v);
-				vbus_max = MAX(vbus_max, v);
 			}
 		}
 
@@ -2142,31 +2082,23 @@ static int sample_ntc(struct ntc_capture *capture)
 	}
 
 	/*
-	 * 充电器输入：两道闸门都过才算"插着充电器"，否则报 0。
-	 *   ① 平均值落在合理区间（太低 = 没插，太高 = 悬空脚乱飘）
-	 *   ② 窗口内跳动不超过 30mV（真 VBUS 稳，悬空脚会飘）
-	 * 这样第 6 脚没接线时也不会误报"插着充电器"。
+	 * 充电器输入：反算回输入端的电压落在 (3.6V, 5V) 开区间内才算插着。
+	 * 没插 ≈3.59V、插着 ≈4.60V，见 VBUS_PRESENT_MIN_MV。
 	 */
 	if (vbus_count > 0U) {
 		uint16_t avg = (uint16_t)(vbus_sum / vbus_count);
-		uint16_t ripple = (uint16_t)(vbus_max - vbus_min);
+		/* 分压比走运行期可调的千分比（0304 特征） */
+		uint32_t vin = (uint32_t)(((uint64_t)avg * vbus_div_permille) / 1000U);
 
-		if (avg >= VBUS_ADC_MIN_PRESENT_MV && avg <= VBUS_ADC_MAX_PLAUSIBLE_MV &&
-		    ripple <= VBUS_ADC_MAX_RIPPLE_MV) {
+		if (vin > VBUS_PRESENT_MIN_MV && vin < VBUS_PRESENT_MAX_MV) {
 			capture->vbus_mv = avg;
 			/*
-			 * 确认插着充电器了，才反算回输入端的真实电压给广播用。
-			 * 没插时留在 0，广播里 0x53 文本就是 "0.00V"（一眼就知道没插）。
+			 * 判为插着才把反算值放进广播；没插时留在 0，
+			 * 广播里 0x0C 就是 0.000V（一眼就知道没插）。
 			 */
-			/* 分压比走运行期可调的千分比（0304 特征） */
-			uint32_t vin = (uint32_t)(((uint64_t)avg * vbus_div_permille) / 1000U);
-
 			capture->vbus_in_mv = (uint16_t)MIN(vin, UINT16_MAX);
 		}
 	}
-
-	/* 模组 6 脚的分压点原始值（不过闸门，读多少就是多少，方便对比） */
-	m6_raw_mv = capture->vbus_mv;
 
 	bat_update_charge_state(capture->bat_mv, capture->vbus_mv != 0U);
 	capture->charge_state = bat_charge_state;
@@ -2463,30 +2395,6 @@ BT_GATT_SERVICE_DEFINE(ip5328_service,
 	BT_GATT_CUD("I2C diag", BT_GATT_PERM_READ),
 );
 
-static ssize_t read_pin_scan(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			     void *buf, uint16_t len, uint16_t offset)
-{
-	uint8_t out[4];
-
-	ARG_UNUSED(conn);
-	ARG_UNUSED(attr);
-
-	if (offset != 0U) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
-
-	if (len < sizeof(out)) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-	}
-
-	sys_put_le16(m6_raw_mv, &out[0]);
-	sys_put_le16(m7_raw_mv, &out[2]);
-
-	memcpy(buf, out, sizeof(out));
-
-	return sizeof(out);
-}
-
 BT_GATT_SERVICE_DEFINE(app_info_service,
 	BT_GATT_PRIMARY_SERVICE(&app_info_service_uuid),
 	BT_GATT_CHARACTERISTIC(&app_version_uuid.uuid, BT_GATT_CHRC_READ,
@@ -2504,9 +2412,6 @@ BT_GATT_SERVICE_DEFINE(app_info_service,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 			       read_voltage_cal, write_voltage_cal, &vbus_div_permille),
 	BT_GATT_CUD("VBUS divider x1000", BT_GATT_PERM_READ),
-	BT_GATT_CHARACTERISTIC(&app_pin_scan_uuid.uuid, BT_GATT_CHRC_READ,
-			       BT_GATT_PERM_READ, read_pin_scan, NULL, NULL),
-	BT_GATT_CUD("Pin6/Pin7 raw mV", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
