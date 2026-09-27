@@ -411,6 +411,17 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define APP_VBUS_DIV_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0304, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
+/*
+ * 6F6B0305 = 模组 6 脚 / 7 脚原始 ADC 读数，只读，uint16 小端 ×2：
+ *   [0:2] 模组第 6 脚 (P1.14 / AIN7) 分压点原始 mV —— 充电输入那一路
+ *   [2:4] 模组第 7 脚 (P1.04 / AIN0) 分压点原始 mV —— 纯诊断
+ *
+ * 两个都是"未经分压比换算"的原始值。分压线焊在哪个脚上，哪一路就有正经读数；
+ * 悬空的脚会飘（跳变大、值不稳定）。
+ */
+#define APP_PIN_SCAN_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0305, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+
 /* ---------------- GPIO 测试开关 ---------------- */
 
 #define GPIO_SWITCH_COUNT 22U
@@ -550,6 +561,11 @@ static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_
 static const struct adc_dt_spec vdd_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
 static const struct adc_dt_spec bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 2);
 static const struct adc_dt_spec vbus_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 3);
+/*
+ * 诊断通道：模组第 7 脚 = P1.04 = AIN0。
+ * 只用来和模组第 6 脚（AIN7）对比，看不经任何换算的原始分压读数。
+ */
+static const struct adc_dt_spec m7_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 4);
 static const struct gpio_dt_spec ntc_power = GPIO_DT_SPEC_GET(DT_ALIAS(ntcpower), gpios);
 static const struct device *const ip_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
@@ -580,6 +596,7 @@ static const struct bt_uuid_128 app_version_uuid = BT_UUID_INIT_128(APP_VERSION_
 static const struct bt_uuid_128 app_sleep_uuid = BT_UUID_INIT_128(APP_SLEEP_UUID_VAL);
 static const struct bt_uuid_128 app_bat_div_uuid = BT_UUID_INIT_128(APP_BAT_DIV_UUID_VAL);
 static const struct bt_uuid_128 app_vbus_div_uuid = BT_UUID_INIT_128(APP_VBUS_DIV_UUID_VAL);
+static const struct bt_uuid_128 app_pin_scan_uuid = BT_UUID_INIT_128(APP_PIN_SCAN_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
@@ -587,6 +604,11 @@ static bool connected;
 static bool vdd_adc_ready;
 static bool bat_adc_ready;
 static bool vbus_adc_ready;
+static bool m7_adc_ready;
+
+/* 模组 6 脚 / 7 脚分压点原始 mV（诊断用，未换算回输入端） */
+static uint16_t m6_raw_mv;
+static uint16_t m7_raw_mv;
 static int16_t adc_sample_buffer[2];
 
 /* 电池电压(mV) → 电量百分比，查 soc_table[] 放电曲线。实现在下面 */
@@ -1709,6 +1731,11 @@ static int configure_io(void)
 	return 0;
 }
 
+static bool setup_optional_adc(const struct adc_dt_spec *spec)
+{
+	return adc_is_ready_dt(spec) && adc_channel_setup_dt(spec) == 0;
+}
+
 static int configure_adc(void)
 {
 	int ret;
@@ -1747,6 +1774,15 @@ static int configure_adc(void)
 		bat_adc_ready = true;
 	} else {
 		LOG_WRN("Battery ADC (模组 4 脚 / P1.12 / AIN5) 不可用，电池电压只能靠 IP5328");
+	}
+
+	/*
+	 * ★ 诊断：模组第 7 脚 = P1.04 = AIN0。
+	 *   失败只告警（这个脚可能什么都没接），绝不影响正常功能。
+	 */
+	m7_adc_ready = setup_optional_adc(&m7_adc);
+	if (!m7_adc_ready) {
+		LOG_WRN("模组 7 脚 (P1.04 / AIN0) 诊断通道不可用");
 	}
 
 	/* 充电器输入 VBUS —— 充电状态的主要依据，见 VBUS_ADC_ENABLE */
@@ -2001,6 +2037,14 @@ static int sample_ntc(struct ntc_capture *capture)
 			}
 		}
 
+		if (m7_adc_ready) {
+			int32_t m7mv;
+
+			if (read_adc_mv(&m7_adc, &m7mv) == 0) {
+				m7_raw_mv = (uint16_t)CLAMP(m7mv, 0, UINT16_MAX);
+			}
+		}
+
 		if (vbus_adc_ready) {
 			ret = read_adc_mv(&vbus_adc, &vbus_mv);
 			if (ret == 0) {
@@ -2120,6 +2164,9 @@ static int sample_ntc(struct ntc_capture *capture)
 			capture->vbus_in_mv = (uint16_t)MIN(vin, UINT16_MAX);
 		}
 	}
+
+	/* 模组 6 脚的分压点原始值（不过闸门，读多少就是多少，方便对比） */
+	m6_raw_mv = capture->vbus_mv;
 
 	bat_update_charge_state(capture->bat_mv, capture->vbus_mv != 0U);
 	capture->charge_state = bat_charge_state;
@@ -2416,6 +2463,30 @@ BT_GATT_SERVICE_DEFINE(ip5328_service,
 	BT_GATT_CUD("I2C diag", BT_GATT_PERM_READ),
 );
 
+static ssize_t read_pin_scan(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset)
+{
+	uint8_t out[4];
+
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+
+	if (offset != 0U) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	if (len < sizeof(out)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	sys_put_le16(m6_raw_mv, &out[0]);
+	sys_put_le16(m7_raw_mv, &out[2]);
+
+	memcpy(buf, out, sizeof(out));
+
+	return sizeof(out);
+}
+
 BT_GATT_SERVICE_DEFINE(app_info_service,
 	BT_GATT_PRIMARY_SERVICE(&app_info_service_uuid),
 	BT_GATT_CHARACTERISTIC(&app_version_uuid.uuid, BT_GATT_CHRC_READ,
@@ -2433,6 +2504,9 @@ BT_GATT_SERVICE_DEFINE(app_info_service,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 			       read_voltage_cal, write_voltage_cal, &vbus_div_permille),
 	BT_GATT_CUD("VBUS divider x1000", BT_GATT_PERM_READ),
+	BT_GATT_CHARACTERISTIC(&app_pin_scan_uuid.uuid, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_pin_scan, NULL, NULL),
+	BT_GATT_CUD("Pin6/Pin7 raw mV", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
