@@ -94,14 +94,21 @@
 	};
 
 	/*
-	 * 充电器输入 VBUS：模组第 16 脚 = P1.07 = AIN3（可选接线）。
+	 * 充电器输入 VBUS：模组第 7 脚 = P1.04 = AIN0。
 	 * 用来直接判断"插没插充电器"，比靠电池电压斜率猜靠谱得多。
 	 *
-	 *   充电器输入 VBUS ──[1MΩ]──┬── 模组第 16 脚
-	 *                             └──[150kΩ]── GND
+	 *   充电输入 5V ──[1MΩ]──┬── 模组第 7 脚
+	 *                        └──[150kΩ]── GND      （再并一颗电容到 GND）
 	 *
 	 * 分压比约 7.67:1：5V→0.65V，9V→1.17V，12V→1.56V，20V→2.61V，
-	 * 全部落在 SAADC 的 3.6V 满量程内。没接线时悬空，固件按"无输入"处理。
+	 * 全部落在 SAADC 的 3.6V 满量程内。
+	 *
+	 * 为什么用 7 脚而不是 16 脚：模组 5/6/7 这三个模拟脚现在都空着
+	 * （5/6 原来是 I2C，7 原来是 IP5328 的 INT），7 脚紧挨着已经焊好的
+	 * 4 脚（电池）和 8 脚（KEY），接线最顺手。16 脚反而在别处。
+	 *
+	 * 没接线时这一脚悬空，读数会乱飘，固件里有两道闸门拦它
+	 * （区间 + 窗口内跳动量），见 src/main.c 的 VBUS_ADC_ENABLE。
 	 */
 	channel@3 {
 		reg = <3>;
@@ -109,7 +116,7 @@
 		zephyr,reference = "ADC_REF_INTERNAL";
 		zephyr,vref-mv = <900>;
 		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
-		zephyr,input-positive = <NRF_SAADC_AIN3>;
+		zephyr,input-positive = <NRF_SAADC_AIN0>;
 		zephyr,resolution = <12>;
 	};
 
