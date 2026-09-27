@@ -203,24 +203,24 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BAT_TREND_MIN_MV 5
 
 /*
- * ★★ 满电电压 —— 这里之前写错，导致"4.1V 就报已充满"。
+ * ★★ 满电电压 —— 按**这块板子实际能充到多少**来设，别照电芯型号猜。
  *
- * 老版本写的是 4100mV，注释还说"静置的锂电 4.1V 以上基本就是满" —— 这是
- * **普通 4.2V 锂电的旧经验，对高压电芯完全不对**。
+ * ★ 板主 2026-09-27 实测确认：这块板子的充电器**最高只充到 4.2V**
+ *   （把充电设定电阻改成 120k 也上不去 4.35V），所以它是一颗普通 4.2V 电芯。
  *
- * 实测这块板子用的是**高压电芯**：
- *   万用表量 4.10V，固件读 4118mV（差 0.4%，说明 ADC 换算没问题），
- *   电芯规格满电 4.35~4.4V。
- *   4.1V 对高压电芯大概只到 75~80%，根本不该说"已充满"。
+ * 之前按"高压电芯 4.35V"把阈值抬到 4300mV，那是错的：
+ *   4.2V 电芯永远充不到 4300，charge_state 会**永远停在 CHARGING**，
+ *   满电永远判不出来；soc_table[] 用 4.35V 的表也会让同一电压下的电量恒偏低
+ *   （3880mV 在 4.35V 表里只给 53%，4.2V 电芯实际约 62%）。
  *
- * 所以阈值抬到 4300mV —— 高压电芯真正充到顶的水平。
- * 如果是普通 4.2V 电芯，把这里改成 4150 即可（改一行）。
+ * 4150mV = 4.2V 满充减去一点 ADC 余量，再配合下面的 !moving（电压不再涨）判满。
+ *
  */
-#define BAT_FULL_MV 4300U
+#define BAT_FULL_MV 4150U
 
 /*
  * 判满还要求"电压不再涨"（见 bat_update_charge_state 里的 !moving）。
- * 因为恒流充到 4.3V 时电压还在爬，只有进恒压阶段、电流掉下来，
+ * 因为恒流充到 4.2V 时电压还在爬，只有进恒压阶段、电流掉下来，
  * 电压才会真正钉住不动 —— 那才是真满。
  */
 
@@ -397,6 +397,20 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define APP_SLEEP_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0302, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
+/*
+ * 电压校准特征（uint16 小端，单位"千分比"，可读可写）：
+ *   6F6B0303 = 电池电压分压比 ×1000（默认 2000 = ×2.000）
+ *   6F6B0304 = 充电输入分压比 ×1000（默认 11000 = ×11.000）
+ *
+ * 目的：分压电阻实际值、ADC 绝对标定、走线压降都会让"按理论比值算"的
+ * 电压偏几个百分点。拿万用表量真实电压，把比值写对就行，不用为了调一个
+ * 数重新编译 + OTA 一遍。掉电不保存，调准了再回来改成默认值。
+ */
+#define APP_BAT_DIV_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0303, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+#define APP_VBUS_DIV_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0304, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+
 /* ---------------- GPIO 测试开关 ---------------- */
 
 #define GPIO_SWITCH_COUNT 22U
@@ -521,14 +535,15 @@ static const struct ntc_point ntc_table[] = {
 };
 
 /*
- * 单节高压锂电（4.35V 满充）开路电压 → 电量。
+ * 单节普通锂电（4.2V 满充）开路电压 → 电量。
  * IP5328 没有直接给 SOC 百分比，只有 BATOCV，所以自己查表。
  */
 static const struct soc_point soc_table[] = {
-	{ 4350U, 100U }, { 4250U, 95U }, { 4180U, 88U }, { 4100U, 80U },
-	{ 4020U, 70U },  { 3950U, 62U }, { 3880U, 53U }, { 3820U, 45U },
-	{ 3760U, 36U },  { 3700U, 28U }, { 3650U, 21U }, { 3600U, 14U },
-	{ 3550U, 9U },   { 3500U, 5U },  { 3400U, 2U },  { 3300U, 0U },
+	{ 4200U, 100U }, { 4150U, 95U }, { 4100U, 90U }, { 4050U, 84U },
+	{ 4000U, 77U },  { 3950U, 70U }, { 3900U, 62U }, { 3850U, 54U },
+	{ 3800U, 45U },  { 3750U, 37U }, { 3700U, 28U }, { 3650U, 21U },
+	{ 3600U, 14U },  { 3550U, 9U },  { 3500U, 5U },  { 3400U, 2U },
+	{ 3300U, 0U },
 };
 
 static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
@@ -563,6 +578,8 @@ static const struct bt_uuid_128 ip5328_diag_uuid = BT_UUID_INIT_128(IP5328_DIAG_
 static const struct bt_uuid_128 app_info_service_uuid = BT_UUID_INIT_128(APP_INFO_SERVICE_UUID_VAL);
 static const struct bt_uuid_128 app_version_uuid = BT_UUID_INIT_128(APP_VERSION_UUID_VAL);
 static const struct bt_uuid_128 app_sleep_uuid = BT_UUID_INIT_128(APP_SLEEP_UUID_VAL);
+static const struct bt_uuid_128 app_bat_div_uuid = BT_UUID_INIT_128(APP_BAT_DIV_UUID_VAL);
+static const struct bt_uuid_128 app_vbus_div_uuid = BT_UUID_INIT_128(APP_VBUS_DIV_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
@@ -590,6 +607,15 @@ static int8_t bat_last_vbus = -1;
 
 /* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
 static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
+
+/*
+ * 运行期电压校准：分压比的千分比形式。
+ *   2000  = ×2.000（电池 1M+1M）
+ *   11000 = ×11.000（充电输入 1M+100k）
+ * 通过下面的 0303 / 0304 特征改写，掉电重置。
+ */
+static uint16_t bat_div_permille = (BAT_ADC_DIVIDER_NUM * 1000U) / BAT_ADC_DIVIDER_DEN;
+static uint16_t vbus_div_permille = (VBUS_DIVIDER_NUM * 1000U) / VBUS_DIVIDER_DEN;
 
 static uint32_t ip_scl_pin;
 static uint32_t ip_sda_pin;
@@ -1614,7 +1640,7 @@ static void put_s16_le(uint8_t *dst, int32_t value)
 /*
  * 电池电压 → 电量百分比。
  *
- * 用 soc_table[] 这条锂电池放电曲线（4.35V 满充 → 3.3V 空）线性插值，
+ * 用 soc_table[] 这条锂电池放电曲线（4.2V 满充 → 3.3V 空）线性插值，
  * 而不是拿两点做直线。
  *
  * 为什么必须查表：锂电池的放电曲线是**中间很平、两头很陡**的。
@@ -2055,7 +2081,8 @@ static int sample_ntc(struct ntc_capture *capture)
 	if (bat_count == 0U) {
 		capture->bat_detect = BAT_DETECT_UNKNOWN;
 	} else if (bat_raw > 0U) {
-		uint32_t bat = (bat_raw * BAT_ADC_DIVIDER_NUM) / BAT_ADC_DIVIDER_DEN;
+		/* 分压比走运行期可调的千分比（0303 特征），调准后就是默认值 */
+		uint32_t bat = (uint32_t)(((uint64_t)bat_raw * bat_div_permille) / 1000U);
 
 		capture->bat_raw_mv = (uint16_t)MIN(bat_raw, 0xFFFFU);
 		if (bat >= BAT_ADC_MIN_VALID_MV && bat <= BAT_ADC_MAX_VALID_MV) {
@@ -2087,7 +2114,8 @@ static int sample_ntc(struct ntc_capture *capture)
 			 * 确认插着充电器了，才反算回输入端的真实电压给广播用。
 			 * 没插时留在 0，广播里 0x53 文本就是 "0.00V"（一眼就知道没插）。
 			 */
-			uint32_t vin = (uint32_t)avg * VBUS_DIVIDER_NUM / VBUS_DIVIDER_DEN;
+			/* 分压比走运行期可调的千分比（0304 特征） */
+			uint32_t vin = (uint32_t)(((uint64_t)avg * vbus_div_permille) / 1000U);
 
 			capture->vbus_in_mv = (uint16_t)MIN(vin, UINT16_MAX);
 		}
@@ -2285,6 +2313,43 @@ static ssize_t read_sleep_enable(struct bt_conn *conn, const struct bt_gatt_attr
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &value, sizeof(value));
 }
 
+static ssize_t read_voltage_cal(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset)
+{
+	const uint16_t *ratio = attr->user_data;
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, ratio, sizeof(*ratio));
+}
+
+static ssize_t write_voltage_cal(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				 const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
+{
+	uint16_t *ratio = attr->user_data;
+	uint16_t value;
+
+	ARG_UNUSED(conn);
+	ARG_UNUSED(flags);
+
+	if (offset != 0U) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	if (len != sizeof(value)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+
+	value = sys_get_le16((const uint8_t *)buf);
+	/* 上限 60000：×60 已经远超任何想得出来的分压比，再大基本是写错了 */
+	if (value > 60000U) {
+		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+
+	*ratio = value;
+	LOG_INF("voltage ratio -> %u permille", value);
+
+	return len;
+}
+
 static ssize_t write_sleep_enable(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				  const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -2360,6 +2425,14 @@ BT_GATT_SERVICE_DEFINE(app_info_service,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 			       read_sleep_enable, write_sleep_enable, NULL),
 	BT_GATT_CUD("Sleep enable", BT_GATT_PERM_READ),
+	BT_GATT_CHARACTERISTIC(&app_bat_div_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+			       read_voltage_cal, write_voltage_cal, &bat_div_permille),
+	BT_GATT_CUD("Battery divider x1000", BT_GATT_PERM_READ),
+	BT_GATT_CHARACTERISTIC(&app_vbus_div_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+			       read_voltage_cal, write_voltage_cal, &vbus_div_permille),
+	BT_GATT_CUD("VBUS divider x1000", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
