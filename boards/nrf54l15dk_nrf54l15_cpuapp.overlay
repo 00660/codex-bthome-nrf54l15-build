@@ -16,7 +16,7 @@
 	};
 
 	zephyr,user {
-		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>;
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>, <&adc 4>;
 	};
 };
 
@@ -110,6 +110,40 @@
 		zephyr,vref-mv = <900>;
 		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
 		zephyr,input-positive = <NRF_SAADC_AIN3>;
+		zephyr,resolution = <12>;
+	};
+
+	/*
+	 * 电池电流：差分输入。
+	 *   正输入 = AIN6 = P1.13 = 模组第 5 脚
+	 *   负输入 = AIN7 = P1.14 = 模组第 6 脚
+	 *
+	 * 采样电阻是板子上已有的那颗（IP5328 的 24 脚 VSP / 25 脚 VSN 之间），
+	 * 不用自己加、不用割线。两端各拉一路 1M/1M 分压到地：
+	 *
+	 *   VSP(24) ──[1M]──┬── 模组 5 脚
+	 *                   └──[1M]── GND
+	 *   VSN(25) ──[1M]──┬── 模组 6 脚
+	 *                   └──[1M]── GND
+	 *
+	 * 分压是必须的：VSP/VSN 坐在 VSYS 上（3~4.2V），直接进 ADC 会超过
+	 * 模组 VDD(3.3V) 的绝对最大额定值。分压后共模降到 1.5~2.1V。
+	 *
+	 * 只要写了 input-negative，ADC 层就自动置 differential=true
+	 * （见 Zephyr 的 ADC_CHANNEL_CFG_FROM_DT），驱动会配成差分模式。
+	 *
+	 * 增益 4：满量程 ±0.9/4 = ±0.225V，12bit 差分 → 约 0.11mV/LSB。
+	 * 采样电阻 10mΩ、电流 2A → 采样电阻上 20mV → 分压后 10mV → 约 91 个码。
+	 * 电阻失配造成的零点偏置（1% 约 21mV）靠固件里的 SHUNT_OFFSET_MV 减掉。
+	 */
+	channel@4 {
+		reg = <4>;
+		zephyr,gain = "ADC_GAIN_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,vref-mv = <900>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN6>;
+		zephyr,input-negative = <NRF_SAADC_AIN7>;
 		zephyr,resolution = <12>;
 	};
 

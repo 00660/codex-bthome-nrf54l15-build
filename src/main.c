@@ -155,6 +155,49 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define VBUS_ADC_ENABLE 0
 #define VBUS_ADC_MIN_PRESENT_MV 250U
 
+/* ---------------- 电池电流（差分 ADC，可选接线） ---------------- */
+
+/*
+ * 采样电阻是板子上【已有】的那颗 —— IP5328 的 24 脚 VSP / 25 脚 VSN 之间。
+ * 不用自己加，也不用割线。
+ *
+ *   VSP(24) ──[1MΩ]──┬── 模组 5 脚 (P1.13 / AIN6)   正输入
+ *                    └──[1MΩ]── GND
+ *   VSN(25) ──[1MΩ]──┬── 模组 6 脚 (P1.14 / AIN7)   负输入
+ *                    └──[1MΩ]── GND
+ *
+ * 为什么要分压：VSP/VSN 坐在 VSYS 上（3.0~4.2V），直接进 ADC 脚会超过
+ * 模组 VDD(3.3V) 的绝对最大额定值。分压后共模降到 1.5~2.1V。
+ *
+ *   I = (正输入 − 负输入) × 分压比 ÷ 采样电阻
+ *   分压比 = (1M + 1M) / 1M = 2
+ *
+ * 为什么 1M 而不是 100k：误差主要来自两颗电阻的【失配】（1% 失配 →
+ * 约 21mV 固定偏置），跟阻值绝对值无关；而 1M 的静态电流只有 2.1µA/路
+ * （两条腿共 4.2µA），不毁待机。这个偏置靠下面的 SHUNT_OFFSET_MV 减掉。
+ *
+ * 没接线时置 0，就不会去采样，报告里 [12:16] 恒为 0。
+ */
+#define SHUNT_ADC_ENABLE 1
+#define SHUNT_DIVIDER_NUM 2U
+#define SHUNT_DIVIDER_DEN 1U
+
+/*
+ * 采样电阻阻值（毫欧）。IP5328 手册没给，常见 5 或 10mΩ。
+ * 先按 10 算。标定：挂一个已知负载，看报告包 [12:14] 的差分 mV，
+ * 真实阻值 = 差分mV × 分压比 ÷ 电流(A)。
+ */
+#define SHUNT_MILLIOHM 10U
+
+/*
+ * 零点偏置（分压后的 mV，有符号）。空载时读到的那个固定值，
+ * 由两颗 1M 的失配造成。标定：不充不放时读 [12:14]，填到这里。
+ */
+#define SHUNT_OFFSET_MV 0
+
+/* 换算出来的电流超过这个数就认为读数不可信，报 0 */
+#define SHUNT_MAX_ABS_MA 15000
+
 #define BATTERY_FULL_MV 3000U
 #define BATTERY_EMPTY_MV 2200U
 
@@ -313,6 +356,9 @@ struct ntc_capture {
 	uint16_t vbus_mv;
 	/* 充电状态，见 BAT_STATE_* */
 	uint8_t charge_state;
+	/* 电池电流：差分测到的分压后电压（有符号 mV），和按假定采样电阻算出的 mA */
+	int16_t shunt_mv;
+	int16_t shunt_ma;
 };
 
 struct soc_point {
@@ -383,6 +429,7 @@ static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_
 static const struct adc_dt_spec vdd_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
 static const struct adc_dt_spec bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 2);
 static const struct adc_dt_spec vbus_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 3);
+static const struct adc_dt_spec shunt_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 4);
 static const struct gpio_dt_spec ntc_power = GPIO_DT_SPEC_GET(DT_ALIAS(ntcpower), gpios);
 static const struct device *const ip_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
@@ -418,6 +465,7 @@ static bool connected;
 static bool vdd_adc_ready;
 static bool bat_adc_ready;
 static bool vbus_adc_ready;
+static bool shunt_adc_ready;
 static int16_t adc_sample_buffer[2];
 
 /* 最近一次 ADC 兜底测到的电池电压（mV）—— 电量百分比的查表在下面，先声明 */
@@ -1366,6 +1414,8 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 		 *   [6:8]   分压后、换算前的原始 mV（1:1 分压时是电池电压的一半）
 		 *   [8:10]  充电器输入 VBUS 分压后的 mV，0 = 没插
 		 *   [10:12] 充电状态（和 [1] bit0~2 同值）
+		 *   [12:14] 电池电流差分值换算回采样电阻上的 mV（有符号）
+		 *   [14:16] 电池电流 mA（有符号，按 SHUNT_MILLIOHM 换算）
 		 */
 		memset(ip5328_report, 0, sizeof(ip5328_report));
 		ip5328_report[0] = IP5328_REPORT_ADC_FALLBACK;
@@ -1378,6 +1428,8 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 		sys_put_le16(ntc->bat_raw_mv, &ip5328_report[6]);
 		sys_put_le16(ntc->vbus_mv, &ip5328_report[8]);
 		sys_put_le16(ntc->charge_state, &ip5328_report[10]);
+		sys_put_le16((uint16_t)ntc->shunt_mv, &ip5328_report[12]);
+		sys_put_le16((uint16_t)ntc->shunt_ma, &ip5328_report[14]);
 		return;
 	}
 
@@ -1528,6 +1580,18 @@ static int configure_adc(void)
 		LOG_WRN("VBUS ADC (模组 16 脚 / P1.07 / AIN3) 不可用，充电器插入检测关闭");
 	}
 
+	/*
+	 * 电池电流差分通道。模组 5/6 脚（P1.13/P1.14）之前是 IP5328 的 I2C，
+	 * 现在改成电流采样用 —— configure_ip5328_io() 先跑，把那两脚放成高阻，
+	 * 这里再由 SAADC 接管成模拟输入。
+	 */
+	shunt_adc_ready = false;
+	if (SHUNT_ADC_ENABLE && adc_is_ready_dt(&shunt_adc) && adc_channel_setup_dt(&shunt_adc) == 0) {
+		shunt_adc_ready = true;
+	} else if (SHUNT_ADC_ENABLE) {
+		LOG_WRN("电流差分 ADC (模组 5/6 脚 / AIN6-AIN7) 不可用，电流读数关闭");
+	}
+
 	return 0;
 }
 
@@ -1660,12 +1724,15 @@ static int sample_ntc(struct ntc_capture *capture)
 	uint32_t vbus_sum = 0;
 	uint16_t bat_count = 0;
 	uint16_t vbus_count = 0;
+	uint32_t shunt_sum = 0;
+	uint16_t shunt_count = 0;
 	uint16_t adc_min = UINT16_MAX;
 	uint16_t adc_max = 0;
 	int32_t adc_mv;
 	int32_t vdd_mv;
 	int32_t bat_mv;
 	int32_t vbus_mv;
+	int32_t shunt_mv;
 	int last_error = -EIO;
 	int ret;
 
@@ -1714,6 +1781,15 @@ static int sample_ntc(struct ntc_capture *capture)
 			}
 		}
 
+		if (shunt_adc_ready) {
+			ret = read_adc_mv(&shunt_adc, &shunt_mv);
+			if (ret == 0) {
+				/* 有符号，负值也要保留，所以先整体抬到正区间再累加 */
+				shunt_sum += (uint32_t)(shunt_mv + 32768);
+				shunt_count++;
+			}
+		}
+
 		adc_mv = CLAMP(adc_mv, 0, UINT16_MAX);
 		vdd_mv = CLAMP(vdd_mv, 0, UINT16_MAX);
 		adc_sum += (uint32_t)adc_mv;
@@ -1757,6 +1833,27 @@ static int sample_ntc(struct ntc_capture *capture)
 		if (capture->vbus_mv < VBUS_ADC_MIN_PRESENT_MV) {
 			capture->vbus_mv = 0U;
 		}
+	}
+
+	/*
+	 * 电池电流：差分平均值 → 减零点偏置 → 还原到采样电阻上 → 除以阻值。
+	 *
+	 *   mV(采样电阻上) = (差分mV − 偏置) × 分压比
+	 *   mA = mV / 毫欧          （mV ÷ mΩ = A，×1000 就是 mA）
+	 */
+	if (shunt_count > 0U) {
+		int32_t avg = (int32_t)(shunt_sum / shunt_count) - 32768;
+		int32_t on_shunt_mv = (avg - SHUNT_OFFSET_MV) * (int32_t)SHUNT_DIVIDER_NUM /
+				      (int32_t)SHUNT_DIVIDER_DEN;
+		int32_t ma = on_shunt_mv * 1000 / (int32_t)SHUNT_MILLIOHM;
+
+		if (ma > SHUNT_MAX_ABS_MA || ma < -SHUNT_MAX_ABS_MA) {
+			ma = 0; /* 读数不可信（多半是线没接好），别报出去吓人 */
+			on_shunt_mv = 0;
+		}
+
+		capture->shunt_mv = (int16_t)CLAMP(on_shunt_mv, INT16_MIN, INT16_MAX);
+		capture->shunt_ma = (int16_t)CLAMP(ma, INT16_MIN, INT16_MAX);
 	}
 
 	bat_update_charge_state(capture->bat_mv);
@@ -1803,7 +1900,7 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	bthome_service_data[BTHOME_VERSION_OFFSET] = APP_PATCHLEVEL;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 1U] = APP_VERSION_MINOR;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 2U] = APP_VERSION_MAJOR;
-	put_s16_le(&bthome_service_data[BTHOME_CURRENT_OFFSET], ip->valid ? ip->bat_ma : 0);
+	put_s16_le(&bthome_service_data[BTHOME_CURRENT_OFFSET], ip->valid ? ip->bat_ma : ntc->shunt_ma);
 
 	ip5328_encode_report(ip, ntc);
 
@@ -1812,6 +1909,7 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
 	LOG_INF("vbus=%umV charge_state=%u", ntc->vbus_mv, ntc->charge_state);
+	LOG_INF("shunt on_shunt=%dmV i=%dmA", ntc->shunt_mv, ntc->shunt_ma);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
