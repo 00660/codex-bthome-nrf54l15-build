@@ -25,6 +25,7 @@
  *   唤醒源 2：模组第 8 脚 KEY 网络下降沿，按下按键立刻醒一轮
  *   每轮流程：采样 → 可连接广播 120 秒（OTA 窗口）→ 停止广播 → 回去睡
  *   广播期间若被连上，一直等到断开才停止广播，所以 OTA 不会被睡眠打断
+ *   ★ 充电中不休眠：插着充电器时不睡，一直可连接、数据每 5 秒刷一次
  *   上电后第一轮也走同样流程，保证刷完固件还能连上验证或重刷
  */
 
@@ -2634,20 +2635,29 @@ int main(void)
 		}
 		publish_sensors(&capture, &ip);
 
-		if (sleep_enabled) {
+		/*
+		 * 充电中不休眠：插着充电器时输入电源一直在，没必要省电，
+		 * 而且这会儿最需要实时看数据。判据和 BTHome 的 0x16 一致
+		 * （CHARGING 或 FULL），它是 VBUS 一变化就立刻更新的，不用等窗口。
+		 */
+		bool charging = (bat_charge_state == BAT_STATE_CHARGING ||
+				 bat_charge_state == BAT_STATE_FULL);
+
+		if (!sleep_enabled || charging) {
+			/*
+			 * 常醒：广播不收，一直保持可连接，数据每 5 秒刷一次，
+			 * 按一下键也能立刻刷。想回正常休眠就往 "Sleep enable" 写 1
+			 * （充电中写了也不睡，拔掉充电器才生效）。
+			 */
+			(void)start_advertising();
+			(void)k_sem_take(&wake_sem, TEST_SAMPLE_INTERVAL);
+		} else {
 			/* OTA 窗口：这段时间可连接广播，电脑端轮询到就能刷机 */
 			advertise_then_stop(K_SECONDS(OTA_WINDOW_SECONDS));
 
 			LOG_INF("idle, wait up to %d min or KEY (count=%u)", 10,
 				key_wake_count);
 			(void)k_sem_take(&wake_sem, SAMPLE_INTERVAL);
-		} else {
-			/*
-			 * 测试模式：广播不收，一直保持可连接，数据每 5 秒刷一次，
-			 * 按一下键也能立刻刷。想回正常休眠就往 "Sleep enable" 写 1。
-			 */
-			(void)start_advertising();
-			(void)k_sem_take(&wake_sem, TEST_SAMPLE_INTERVAL);
 		}
 
 		/* 按键机械抖动，等电平稳定后再采样 */
