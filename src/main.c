@@ -76,11 +76,25 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 想要 IDLE / DISCHARGING / FULL 四态细分的话，这个标准对象做不到，
  * 得去读 GATT 报告特征值（6f6b0201-…）的 [10:12]。
  */
+/*
+ * 各字段的字节偏移。语义统一：**指向该字段的「值」的第一个字节**，
+ * 不包括前面那个 object id 字节。
+ *
+ * 对照（下标从 0 开始）：
+ *   0  1  2   : D2 FC 40          BTHome UUID + v2 标识
+ *   3  4      : 01 BB             battery
+ *   5  6  7   : 02 TT TT          temperature
+ *   8  9  10  : 0C VV VV          voltage
+ *   11 12     : 15 CC             charging
+ *   13 14 15 16: F2 PP MM JJ      firmware version
+ *
+ * 所以 VERSION_OFFSET = 14（PP 的下标），数组总长 = 14 + 3 = 17。
+ */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
 #define BTHOME_VOLTAGE_OFFSET 9U
 #define BTHOME_CHARGING_OFFSET 12U
-#define BTHOME_VERSION_OFFSET 13U
+#define BTHOME_VERSION_OFFSET 14U
 
 /* ---------------- NTC ---------------- */
 
@@ -491,7 +505,7 @@ static uint32_t diag_key_count;
 static bool diag_from_key;
 
 /*
- * BTHome service data，16 字节：
+ * BTHome service data，17 字节：
  *   D2 FC         BTHome UUID，小端
  *   40            BTHome v2，未加密
  *   01 BB         battery，uint8，%
@@ -520,15 +534,20 @@ static uint8_t bthome_service_data[] = {
 	APP_VERSION_MAJOR,
 };
 
+/*
+ * 数组总长 = 版本号第一个值字节的下标 + 3（PP / MM / JJ 三个字节）。
+ * 这个 assert 是防呆的：加字段时漏一个占位 0x00 就会在这里编译失败，
+ * 而不是等到设备上广播解析不出来才发现。
+ */
 BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
 
 /* IP5328 全量数据，给 GATT 只读特征值用 */
 static uint8_t ip5328_report[IP5328_REPORT_LEN];
 
 /*
- * 广播包只有 31 字节，BTHome service data 16 字节，再塞完整设备名就超了。
+ * 广播包只有 31 字节，BTHome service data 17 字节，再塞完整设备名就超了。
  * 所以设备名挪到 scan response 里，两边都放得下：
- *   ad = flags(3) + service data(2+16) = 21 字节
+ *   ad = flags(3) + service data(2+17) = 22 字节
  *   sd = name(9) + 128bit UUID(18)     = 27 字节
  */
 static const struct bt_data ad[] = {

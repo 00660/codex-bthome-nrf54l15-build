@@ -292,9 +292,9 @@ KEY ── WLED(照明 LED，阳极在 KEY、阴极在 GND)
 
 ## BLE 广播
 
-设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 16 字节 service data）。
+设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 17 字节 service data）。
 
-BTHome service data（16 字节）：
+BTHome service data（17 字节）：
 
 ```text
 D2 FC 40 01 BB 02 TT TT 0C VV VV 15 CC F2 PP MM JJ
