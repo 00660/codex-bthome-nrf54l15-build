@@ -61,7 +61,6 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BTHOME_DEVICE_INFO_V2 0x40
 #define BTHOME_ID_BATTERY 0x01
 #define BTHOME_ID_TEMPERATURE 0x02
-#define BTHOME_ID_VBUS_VOLTAGE 0x0C
 #define BTHOME_ID_CHARGING 0x16
 #define BTHOME_ID_VOLTAGE 0x4A
 #define BTHOME_ID_FIRMWARE_VERSION 0xF2
@@ -85,12 +84,11 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  *   0x0C  voltage  factor 0.001V  ← 精度高（能到 1mV），量程 0~65.535V
  *   0x4A  voltage  factor 0.1V    ← 精度低（只到 100mV），量程 0~6553.5V
  *
- * ★ 分辨率怎么分（2026-09-27 换过位，别按老版本记忆）：
- *   0x0C 给**充电输入电压** —— 需要看清楚是 4.93V 还是 5.01V，要 1mV 精度。
- *   0x4A 给**电池电压**   —— 看趋势就够，0.1V 一档完全能接受。
+ * ★ **0x0C 已经不用了** —— 充电输入电压不广播了，只留 0x4A 报电池电压。
+ *   判"插没插充电器"看 0x16 charging 那一位就够，不必再建一个电压实体。
  *
- * ⚠️ 注意 id 顺序导致的位置：0x0C(12) < 0x16(22) < 0x4A(74)，
- *    所以**电池电压在充电电压后面**，offset 也是反的。见下面的下标对照表。
+ * ⚠️ 注意 id 顺序：0x16(22) < 0x4A(74)，
+ *    所以**充电状态在电池电压前面**。见下面的下标对照表。
  *
  * charging 是 **0x16**（device_class = BATTERY_CHARGING）。
  *
@@ -108,31 +106,28 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 它**不会建实体**，但解析器会拿它调 set_device_sw_version()，
  * 所以在 HA 的设备详情页"固件版本"那一栏能看到 —— 不是白放的。
  *
- * ★ 两个 voltage 实体在 HA 里都会叫"电压"（重名会自动加 _2 后缀），
- *   因为 **BTHome 协议没有给实体指定名字的字段**，名字是接收端按
- *   device_class 拼的，固件侧改不了。要区分只能在 HA 里手动改名。
+ * ★ BTHome 协议没有给实体指定名字的字段，名字是接收端按 device_class
+ *   拼的，固件侧改不了。要改名字只能在 HA 里手动改。
  */
 /*
  * 各字段的字节偏移。语义统一：**指向该字段的「值」的第一个字节**，
  * 不包括前面那个 object id 字节。
  *
- * 对照（下标从 0 开始）—— 注意电池电压在充电电压**后面**：
+ * 对照（下标从 0 开始）：
  *   0  1  2      : D2 FC 40          BTHome UUID + v2 标识
  *   3  4         : 01 BB             battery
  *   5  6  7      : 02 TT TT          temperature
- *   8  9  10     : 0C II II          voltage（充电输入，0.001V，高精度）
- *   11 12        : 16 CC             charging
- *   13 14 15     : 4A BB BB          voltage（电池，0.1V）
- *   16 17 18 19  : F2 PP MM JJ       firmware version
+ *   8  9         : 16 CC             charging（1 = 插着充电器 / 0 = 没插）
+ *   10 11 12     : 4A BB BB          voltage（电池，0.1V）
+ *   13 14 15 16  : F2 PP MM JJ       firmware version
  *
- * 所以 VERSION_OFFSET = 17（PP 的下标），数组总长 = 17 + 3 = 20。
+ * 所以 VERSION_OFFSET = 14（PP 的下标），数组总长 = 14 + 3 = 17。
  */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
-#define BTHOME_VBUS_VOLTAGE_OFFSET 9U
-#define BTHOME_CHARGING_OFFSET 12U
-#define BTHOME_VOLTAGE_OFFSET 14U
-#define BTHOME_VERSION_OFFSET 17U
+#define BTHOME_CHARGING_OFFSET 9U
+#define BTHOME_VOLTAGE_OFFSET 11U
+#define BTHOME_VERSION_OFFSET 14U
 
 /*
  * 0x4A 的 factor 是 0.1V，所以填进去的是**十分之一伏**的整数。
@@ -629,18 +624,17 @@ static uint32_t diag_key_count;
 static bool diag_from_key;
 
 /*
- * BTHome service data，20 字节：
+ * BTHome service data，17 字节：
  *   D2 FC         BTHome UUID，小端
  *   40            BTHome v2，未加密
  *   01 BB         battery，uint8，%
  *   02 TT TT      temperature，sint16，0.01 °C
- *   0C II II      voltage，uint16，0.001 V（充电输入电压，高精度）
  *   16 CC         charging，uint8，1 = 插着充电器 / 0 = 没插
  *   4A BB BB      voltage，uint16，0.1 V（电池电压）
  *   F2 PP MM JJ   firmware version，patch/minor/major
  *
- * 注意 0x0C 在 0x4A 前面（id 必须升序），所以**充电电压的下标比电池电压小**，
- * 跟人的直觉相反，改的时候别按"先电池后充电"的顺序去数。
+ * object id 必须升序（01 < 02 < 16 < 4A < F2），充电状态夹在温度和
+ * 电池电压中间。
  */
 static uint8_t bthome_service_data[] = {
 	BTHOME_UUID_LE_0,
@@ -649,9 +643,6 @@ static uint8_t bthome_service_data[] = {
 	BTHOME_ID_BATTERY,
 	0x00,
 	BTHOME_ID_TEMPERATURE,
-	0x00,
-	0x00,
-	BTHOME_ID_VBUS_VOLTAGE,
 	0x00,
 	0x00,
 	BTHOME_ID_CHARGING,
@@ -674,7 +665,7 @@ BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
 
 /*
  * 广播包不能超过 31 字节，算一遍留个底：
- *   ad = flags(3) + service data(2+20) = 25 字节  ✓
+ *   ad = flags(3) + service data(2+17) = 22 字节  ✓
  * 以后加字段时注意别把这行撑爆（超了 bt_le_adv_start 会返回 -EINVAL）。
  */
 BUILD_ASSERT(sizeof(bthome_service_data) + 5U <= 31U);
@@ -683,9 +674,8 @@ BUILD_ASSERT(sizeof(bthome_service_data) + 5U <= 31U);
 static uint8_t ip5328_report[IP5328_REPORT_LEN];
 
 /*
- * 广播包只有 31 字节，BTHome service data 24 字节，再塞完整设备名就超了。
- * 所以设备名挪到 scan response 里，两边都放得下：
- *   ad = flags(3) + service data(2+24) = 29 字节  (上限 31)
+ * 广播包只有 31 字节，塞不下完整设备名，所以设备名挪到 scan response 里：
+ *   ad = flags(3) + service data(2+17) = 22 字节  (上限 31)
  *   sd = name(9) + 128bit UUID(18)     = 27 字节  (上限 31)
  */
 static const struct bt_data ad[] = {
@@ -2093,8 +2083,8 @@ static int sample_ntc(struct ntc_capture *capture)
 		if (vin > VBUS_PRESENT_MIN_MV && vin < VBUS_PRESENT_MAX_MV) {
 			capture->vbus_mv = avg;
 			/*
-			 * 判为插着才把反算值放进广播；没插时留在 0，
-			 * 广播里 0x0C 就是 0.000V（一眼就知道没插）。
+			 * 判为插着才记下反算值。广播里已经不报这个电压了，
+			 * 只留给日志看（想知道插着时输入端到底多少 V）。
 			 */
 			capture->vbus_in_mv = (uint16_t)MIN(vin, UINT16_MAX);
 		}
@@ -2141,14 +2131,6 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	bthome_service_data[BTHOME_BATTERY_OFFSET] = soc;
 	put_s16_le(&bthome_service_data[BTHOME_TEMP_OFFSET], ntc->temp_centi);
 	/*
-	 * 0x0C voltage：充电器输入电压（已经把 11:1 分压反算回去了）。
-	 *
-	 * ★ 0x0C 的 factor 是 0.001V，所以填的是 **mV**（和电池电压以前一样）。
-	 * 给 0x0C 是为了精度 —— 要看清是 4.93V 还是 5.01V，0.1V 一档不够。
-	 * 没插充电器时 vbus_in_mv 是 0，填 0，HA 上显示 0.000V，一眼就知道没插。
-	 */
-	sys_put_le16(ntc->vbus_in_mv, &bthome_service_data[BTHOME_VBUS_VOLTAGE_OFFSET]);
-	/*
 	 * 0x16 charging：这是布尔量，只能表达"有没有在充电"。
 	 * CHARGING（正在充）和 FULL（插着但已充满）都算"插着充电器"报 1，
 	 * 其余（IDLE 待机 / DISCHARGING 放电 / UNKNOWN 没攒够窗口）报 0。
@@ -2160,8 +2142,7 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	/*
 	 * 0x4A voltage：电池电压。
 	 * ★ factor 是 0.1V，填的是**十分之一伏**：4120mV → 41（HA 显示 4.1V）。
-	 * 给 0x4A 是因为电池电压只看趋势，0.1V 分辨率够，把高精度的 0x0C
-	 * 让给充电电压。填 mV 会显示成 412.0V，差十倍。
+	 * 电池电压只看趋势，0.1V 分辨率就够。填 mV 会显示成 412.0V，差十倍。
 	 */
 	sys_put_le16((uint16_t)(volt_mv / BATTERY_VOLTAGE_DECIVOLTS_DIV),
 		     &bthome_service_data[BTHOME_VOLTAGE_OFFSET]);
@@ -2176,8 +2157,7 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u detect=%s", ntc->bat_raw_mv, ntc->bat_mv,
 		soc, bat_detect_name(ntc->bat_detect));
-	LOG_INF("vbus=%umV -> 0x0C 填 %umV(0.001V档)  charge_state=%u  "
-		"0x4A 填 %u(0.1V档,=%umV)",
+	LOG_INF("vbus=%umV(%umV) charge_state=%u  0x4A 填 %u(0.1V档,=%umV)",
 		ntc->vbus_mv, ntc->vbus_in_mv, ntc->charge_state,
 		ntc->bat_mv / BATTERY_VOLTAGE_DECIVOLTS_DIV, ntc->bat_mv);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
