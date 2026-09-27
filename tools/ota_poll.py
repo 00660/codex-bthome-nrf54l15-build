@@ -26,11 +26,64 @@ import asyncio
 import hashlib
 import pathlib
 import sys
+import time
 
 from smpclient import SMPClient
 from smpclient.requests.image_management import ImageStatesRead, ImageStatesWrite
 from smpclient.requests.os_management import ResetWrite
 from smpclient.transport.ble import SMPBLETransport
+
+# ---------------------------------------------------------------------------
+# Windows + bleak(WinRT) 的 MTU 竞态补丁
+# ---------------------------------------------------------------------------
+# smpclient 发现"SMP 特征只能写 20 字节"时，会固定 `sleep(2)` 就去读：
+#     client._backend._session.max_pdu_size
+# 但 bleak 的 WinRT 后端里 `_session` 是**异步**建立的（GattSession 激活后才赋值）。
+# 会话建立稍慢时 2 秒还没到，`_session` 仍是 None，于是：
+#     AttributeError: 'NoneType' object has no attribute 'max_pdu_size'
+# 这一次连接就直接被判死 —— 表现出来就是"明明扫到了却连不上"，
+# 而且因为是竞态，重试起来时好时坏。
+#
+# 这里把那段逻辑接管过来：先跳过它，连上之后再自己耐心等 `_session` 就绪
+# （最多 10 秒）拿真实 `max_pdu_size`。拿不到就保持特征自报的 20 字节，
+# 功能不受影响，只是上传慢一点。
+# ---------------------------------------------------------------------------
+_SESSION_WAIT_S = 10.0
+
+_orig_connect = SMPBLETransport.connect
+# 让 smpclient 内部那段有竞态的重读逻辑走不到（它本来也只是把 20 再算成 20）
+SMPBLETransport._winrt_backend = staticmethod(lambda _backend: False)  # type: ignore[method-assign]
+
+
+async def _patched_connect(self, address: str, timeout_s: float) -> None:
+    await _orig_connect(self, address, timeout_s)
+
+    if self._max_write_without_response_size != 20:
+        return  # Windows 没给到那 20 字节的占位值，说明本来就没问题
+
+    try:
+        backend = getattr(self._client, "_backend", None)
+        deadline = time.monotonic() + _SESSION_WAIT_S
+        session = None
+        while time.monotonic() < deadline:
+            session = getattr(backend, "_session", None)
+            if session is not None:
+                break
+            await asyncio.sleep(0.25)
+
+        max_pdu = getattr(session, "max_pdu_size", 0) or 0
+        if max_pdu <= 3:
+            return  # 等不到就保持 20，能刷只是慢
+
+        mtu = max_pdu - 3
+        self._smp_characteristic._max_write_without_response_size = mtu  # type: ignore[attr-defined]
+        self._max_write_without_response_size = mtu
+        print(f"    （BLE 可写长度 20 -> {mtu}）", flush=True)
+    except Exception as exc:  # MTU 只是优化，拿不到不该影响 OTA
+        print(f"    （MTU 优化跳过：{type(exc).__name__}: {exc}）", flush=True)
+
+
+SMPBLETransport.connect = _patched_connect  # type: ignore[method-assign]
 
 DEFAULT_TARGET = "EA:9F:FE:F3:26:5B"
 
