@@ -138,7 +138,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
  * 是线没上拉、主板没醒、还是从机根本不应答。
  */
-#define IP5328_DIAG_LEN 32U
+#define IP5328_DIAG_LEN 34U
 
 #define IP5328_SERVICE_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0200, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
@@ -929,6 +929,12 @@ static void ip_line_probe(uint32_t pin, uint8_t *low_release, uint8_t *high_rele
  *   [29]    第 13 脚（NFC2，本该悬空）：驱动低放开后的电平
  *   [30]    反向组合（6 脚 = SCL，5 脚 = SDA）2µs probe 0x75，0 = 收到 ACK
  *   [31]    反向组合全地址扫描命中数
+ *   [32]    长按 KEY 10 秒复位 IP5328 之后，probe 0x75 的结果，0 = 收到 ACK
+ *   [33]    复位之后快速全地址扫描命中数
+ *
+ *   [32]/[33] 是最后手段。手册第 18 页：「超长按 10s 可复位整个系统」——
+ *   这是唯一不用拔电池就能让 IP5328 重跑一遍"上电检测 DMB/DPB 电平"的软件办法。
+ *   如果它当初就是因为上电那一刻电平不对才没进 I2C 模式，这一下能救回来。
  *
  *   [30]/[31] 只报结果，不参与主流程 —— 主流程一律按 5=SCL / 6=SDA 走。
  *   加它是因为：用户是从 USB 口背面的丝印接的线，而 USB 的 DM/DP 和
@@ -1106,10 +1112,41 @@ static void ip5328_diag_run(void)
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_NFC2, GPIO_INPUT);
 
+	/*
+	 * 最后手段：替用户长按 10 秒，把 IP5328 整个复位一次。
+	 *
+	 * 手册第 18 页：「超长按 10s 可复位整个系统」。芯片只在【自己上电那一刻】
+	 * 检测 DMB/DPB 电平来决定进不进 I2C 模式，一旦错过就再也进不去 ——
+	 * 而按键复位是唯一不用拔电池就能让它重跑一遍这个检测的软件办法。
+	 *
+	 * 拉低 10s + 恢复 50ms + 等 3s 让芯片重启完，然后重新探一遍。
+	 * 如果模组本身也从 VREG 取电，这一下会把自己也重启 —— 那也没关系，
+	 * 重启后固件会重新跑一遍诊断。
+	 *
+	 * 前面隔 1.2s 再按：手册里「1s 内连续两次短按会强制关机」，
+	 * 上面刚按过一次 150ms，离太近可能被算成双击。
+	 */
+	k_msleep(1200);
+	(void)ip5328_key_press(10000);
+	k_msleep(3000);
+
+	ip_i2c_set_delay(IP5328_DELAY_FAST);
+	ip_i2c_bind(IP5328_PIN_M5, IP5328_PIN_M6);
+	ip_i2c_bus_recover();
+	ip5328_diag[32] = (uint8_t)ip_i2c_probe(IP5328_ADDR7);
+
+	n_fast = 0U;
+	for (uint8_t a = 0x08U; a <= 0x77U; a++) {
+		if (ip_i2c_probe(a) == 0) {
+			n_fast++;
+		}
+	}
+	ip5328_diag[33] = n_fast;
+
 	LOG_INF("diag int=%u/%u/%u idle=%u%u pup=%u%u pdn=%u%u rec=%u%u "
 		"nak=%u/%u/%u hits=%u,%u slow=%u,%u edges=%u/%u "
 		"afterkey=%u int=%u hits=%u keynet=%u "
-		"m8=%u/%u m7=%u/%u nfc2=%u rev=%u hits=%u",
+		"m8=%u/%u m7=%u/%u nfc2=%u rev=%u hits=%u hold=%u hits=%u",
 		ip5328_diag[1], ip5328_diag[17], ip5328_diag[18], ip5328_diag[2],
 		ip5328_diag[3], ip5328_diag[4], ip5328_diag[5], ip5328_diag[6],
 		ip5328_diag[7], ip5328_diag[8], ip5328_diag[9], ip5328_diag[10],
@@ -1118,7 +1155,8 @@ static void ip5328_diag_run(void)
 		ip5328_diag[20], ip5328_diag[21], ip5328_diag[22],
 		ip5328_diag[23], ip5328_diag[24], ip5328_diag[25],
 		ip5328_diag[26], ip5328_diag[27], ip5328_diag[28],
-		ip5328_diag[29], ip5328_diag[30], ip5328_diag[31]);
+		ip5328_diag[29], ip5328_diag[30], ip5328_diag[31],
+		ip5328_diag[32], ip5328_diag[33]);
 }
 
 static int ip5328_sample(struct ip5328_data *d)
