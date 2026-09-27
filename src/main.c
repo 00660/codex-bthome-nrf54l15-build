@@ -497,6 +497,8 @@ static uint16_t bat_trend_avg;   /* 上一个窗口的平均值 */
 static int64_t bat_trend_ms;     /* 上一个窗口结束的时刻 */
 static bool bat_trend_valid;     /* 是否已经打过基准 */
 static uint8_t bat_charge_state = BAT_STATE_UNKNOWN;
+/* 上一次看到的 VBUS 状态，-1 = 还没看过。用来在插拔瞬间立刻出结论 */
+static int8_t bat_last_vbus = -1;
 
 /* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
 static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
@@ -1707,10 +1709,35 @@ static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 		return; /* 分压没接，不猜 */
 	}
 
+	now = k_uptime_get();
+
+	/*
+	 * VBUS 一变化就立刻出结论，不等窗口。
+	 * 插上/拔掉充电器是个瞬时事件，让人等 5 分钟才看到状态变化没道理。
+	 * 同时把趋势窗口重置 —— 插拔瞬间电压会跳，那段数据不能进斜率比较。
+	 */
+	if ((int8_t)vbus_present != bat_last_vbus) {
+		bat_last_vbus = (int8_t)vbus_present;
+
+		if (vbus_present) {
+			bat_charge_state = (mv >= BAT_FULL_MV) ? BAT_STATE_FULL : BAT_STATE_CHARGING;
+		} else {
+			bat_charge_state = (mv >= BAT_FULL_MV) ? BAT_STATE_FULL : BAT_STATE_IDLE;
+		}
+
+		LOG_INF("charge state -> %u (vbus=%u, 立即判定)", bat_charge_state, vbus_present);
+
+		bat_trend_avg = mv;
+		bat_trend_ms = now;
+		bat_trend_valid = true;
+		bat_trend_sum = 0U;
+		bat_trend_count = 0U;
+		return;
+	}
+
 	bat_trend_sum += mv;
 	bat_trend_count++;
 
-	now = k_uptime_get();
 	if (now - bat_trend_ms < (int64_t)BAT_TREND_WINDOW_MS) {
 		return; /* 窗口还没到，继续攒 */
 	}
