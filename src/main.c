@@ -145,7 +145,14 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define NTC_SAMPLE_COUNT 8U
 #define NTC_SETTLE_TIME K_MSEC(50)
 #define NTC_SAMPLE_INTERVAL K_MSEC(2)
-#define NTC_SUPPLY_FALLBACK_MV 3300U
+/*
+ * 模组供电（LDO 输出）的兜底值。实测这块板子是 3320mV（VDD 通道读出来的
+ * 就是这个数，万用表也对得上），所以兜底改成 3320，比之前猜的 3300 准。
+ *
+ * ★ 这个值只在 VDD 通道读失败时才用得上（正常情况下一直读实测值）。
+ *   供电接的是 3.3V LDO，满载也就掉几十 mV，所以 3320 是个安全估计。
+ */
+#define NTC_SUPPLY_FALLBACK_MV 3320U
 #define NTC_ADC_FULL_SCALE_MV 3600U
 #define NTC_ADC_MAX_RAW ((1U << 12) - 1U)
 
@@ -222,6 +229,19 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BAT_STATE_CHARGING 2U    /* 充电中 */
 #define BAT_STATE_DISCHARGING 3U /* 放电中 */
 #define BAT_STATE_FULL 4U        /* 已充满 */
+
+/* ---------------- 电池检测（脱线 / 越界） ---------------- */
+
+/*
+ * 把"电池电压这一次读数为什么不可信"分类记下来，别都糊成一个 0。
+ *
+ * 以前只有一个 bat_mv：够不着区间就不写，留在 0，广播里电量跟着掉 0%，
+ * 但看不出到底是没接电池、还是采样通道坏了。
+ */
+#define BAT_DETECT_UNKNOWN 0U      /* 一个样本都没采到：ADC 通道有问题 */
+#define BAT_DETECT_OK 1U           /* 检测正常，bat_mv 有效 */
+#define BAT_DETECT_DISCONNECTED 2U /* 分压脚没电平：电池没接 / 分压断了 */
+#define BAT_DETECT_OVERRANGE 3U    /* 电压高得离谱：基准漂了 / 脚短路 */
 
 /* ---------------- 充电器输入 VBUS（充电状态的可靠来源） ---------------- */
 
@@ -438,6 +458,13 @@ struct ntc_capture {
 	uint16_t vbus_in_mv;
 	/* 充电状态，见 BAT_STATE_* */
 	uint8_t charge_state;
+	/*
+	 * 电池检测结果的分类，见 BAT_DETECT_*。
+	 *
+	 * 只靠 bat_mv 是不是 0 分不清"真没接"和"读取全失败"，
+	 * 所以把原因记下来：脱线/短路/电压越界都各是各的。
+	 */
+	uint8_t bat_detect;
 };
 
 struct soc_point {
@@ -1466,27 +1493,48 @@ static int ip5328_sample(struct ip5328_data *d)
 	return -EIO;
 }
 
-static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_capture *ntc)
+static const char *bat_detect_name(uint8_t detect)
 {
-	if (!d->valid) {
+	switch (detect) {
+	case BAT_DETECT_OK:
+		return "OK";
+	case BAT_DETECT_DISCONNECTED:
+		return "DISCONNECTED";
+	case BAT_DETECT_OVERRANGE:
+		return "OVERRANGE";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_capture *ntc)
+{	if (!d->valid) {
 		/*
 		 * 纯 ADC 模式（I2C 关了，或者读失败）：这一格改报 ADC 实测的数据，
 		 * 方便现场验收，不用看串口日志。
 		 *
 		 *   [0]     0xFE = 本包是 ADC 数据
-		 *   [1]     bit0~2 充电状态，bit4 充电中，bit6 已充满（沿用原来的位语义）
+		 *   [1]     bit0~2 充电状态，bit3 电池脱线，bit4 充电中，
+		 *           bit5 电压越界，bit6 已充满（沿用原来的位语义）
 		 *   [2]     bit0~2 同上，方便只读一个字节的人
 		 *   [3]     电量 %
 		 *   [4:6]   电池电压 mV（分压换算回 BAT 端）
 		 *   [6:8]   分压后、换算前的原始 mV（1:1 分压时是电池电压的一半）
 		 *   [8:10]  充电器输入 VBUS 分压后的 mV，0 = 没插
 		 *   [10:12] 充电状态（和 [1] bit0~2 同值）
-		 *   [12:16] 保留未用，恒 0（电流通道已取消）
+		 *   [12:14] 模组供电 VDD mV（NTC 分压基准，实测约 3320）
+		 *   [14:16] NTC 原始 ADC mV（配合 [12:14] 能反推 NTC 阻值）
+		 *
+		 * ★ [12:16] 原本是"保留恒 0"，现在改成放 VDD 和 NTC ADC ——
+		 *   温度不准的时候，看这两个值就能判断是 NTC 电路的问题还是
+		 *   换算的问题，不用接串口。
 		 */
 		memset(ip5328_report, 0, sizeof(ip5328_report));
 		ip5328_report[0] = IP5328_REPORT_ADC_FALLBACK;
 		ip5328_report[1] = (uint8_t)((ntc->charge_state & 0x07U) |
+					     (ntc->bat_detect == BAT_DETECT_DISCONNECTED ? 0x08U : 0U) |
 					     (ntc->charge_state == BAT_STATE_CHARGING ? 0x10U : 0U) |
+					     (ntc->bat_detect == BAT_DETECT_OVERRANGE ? 0x20U : 0U) |
 					     (ntc->charge_state == BAT_STATE_FULL ? 0x40U : 0U));
 		ip5328_report[2] = (uint8_t)(ntc->charge_state & 0x07U);
 		ip5328_report[3] = soc_from_mv(ntc->bat_mv);
@@ -1494,6 +1542,8 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 		sys_put_le16(ntc->bat_raw_mv, &ip5328_report[6]);
 		sys_put_le16(ntc->vbus_mv, &ip5328_report[8]);
 		sys_put_le16(ntc->charge_state, &ip5328_report[10]);
+		sys_put_le16(ntc->vdd_mv, &ip5328_report[12]);
+		sys_put_le16(ntc->adc_mv, &ip5328_report[14]);
 		return;
 	}
 
@@ -1857,9 +1907,7 @@ static int sample_ntc(struct ntc_capture *capture)
 {
 	uint32_t adc_sum = 0;
 	uint32_t vdd_sum = 0;
-	uint32_t bat_sum = 0;
 	uint32_t vbus_sum = 0;
-	uint16_t bat_count = 0;
 	uint16_t vbus_count = 0;
 	uint16_t vbus_min = UINT16_MAX;
 	uint16_t vbus_max = 0;
@@ -1871,6 +1919,24 @@ static int sample_ntc(struct ntc_capture *capture)
 	int32_t vbus_mv;
 	int last_error = -EIO;
 	int ret;
+
+	/*
+	 * ★ 电池电压单独存全部样本，最后取中值（不用平均）。
+	 *
+	 * 为什么要这样：实测抓到一个 bug —— 正常读数 4116mV，偶尔某一次掉到
+	 * 3168mV（掉了 950mV，raw 从 2059 变成 1584，比例 0.77）。
+	 * 8 次求平均时这一个疙瘩就能把结果从 4116 拉到 3168，
+	 * soc_from_mv(3168) 直接算出 0% —— 电量显示瞬间归零，很吓人。
+	 *
+	 * 中值（排序取中间那个）对少数离群点天然免疫：只要异常次数不到一半，
+	 * 结果完全不受影响。8 个样本用插入排序，代码几行就够。
+	 *
+	 * VBUS 不用这套 —— 它有 min/max/ripple 三道闸门，本来就靠"跳动量"
+	 * 判断是不是悬空脚，取中值反而会把它的闸门逻辑搞乱。
+	 */
+	uint16_t bat_samples[NTC_SAMPLE_COUNT];
+	uint16_t bat_count = 0;
+	uint32_t bat_raw = 0;
 
 	*capture = (struct ntc_capture){ 0 };
 
@@ -1903,9 +1969,9 @@ static int sample_ntc(struct ntc_capture *capture)
 
 		if (bat_adc_ready) {
 			ret = read_adc_mv(&bat_adc, &bat_mv);
-			if (ret == 0) {
-				bat_sum += (uint32_t)CLAMP(bat_mv, 0, UINT16_MAX);
-				bat_count++;
+			if (ret == 0 && bat_count < NTC_SAMPLE_COUNT) {
+				bat_samples[bat_count++] =
+					(uint16_t)CLAMP(bat_mv, 0, UINT16_MAX);
 			}
 		}
 
@@ -1937,6 +2003,31 @@ static int sample_ntc(struct ntc_capture *capture)
 		return last_error;
 	}
 
+	/*
+	 * ★ 电池电压：先插入排序，再取中值（不是平均）。
+	 *
+	 * 原因见函数开头 bat_samples[] 的说明 —— 偶发一次读数掉 950mV，
+	 * 求平均会把电量从 83% 直接拉到 0%。取中值就完全不受影响。
+	 */
+	if (bat_count > 0U) {
+		/* 插入排序：8 个元素，最坏 28 次比较，比调 qsort 轻 */
+		for (uint16_t i = 1; i < bat_count; i++) {
+			uint16_t key = bat_samples[i];
+			int32_t j = (int32_t)i - 1;
+
+			while (j >= 0 && bat_samples[j] > key) {
+				bat_samples[j + 1] = bat_samples[j];
+				j--;
+			}
+			bat_samples[j + 1] = key;
+		}
+
+		/* 取中值。偶数个取中间两个的平均（这里是 (n-1)/2 和 n/2） */
+		bat_raw = (uint32_t)((bat_samples[(bat_count - 1U) / 2U] +
+				      bat_samples[bat_count / 2U]) /
+				     2U);
+	}
+
 	capture->adc_mv = (uint16_t)(adc_sum / capture->sample_count);
 	capture->vdd_mv = (uint16_t)(vdd_sum / capture->sample_count);
 	capture->adc_min_mv = adc_min;
@@ -1945,17 +2036,38 @@ static int sample_ntc(struct ntc_capture *capture)
 	capture->temp_centi = ntc_ohms_to_centi(capture->ntc_ohms);
 
 	/*
+	 * ★ 电池检测：不只看电压合不合理，还要把"为什么不合理"记下来。
+	 *
 	 * 分压后的电压换算回 BAT 端：(adc × NUM) / DEN。
-	 * 换算完再判区间 —— 悬空脚读出来的值大概率落不进来，就被当成"没接"。
+	 * 换算完再判区间 —— 悬空脚读出来的值大概率落不进来。
+	 *
+	 * 判据（BAT_DETECT_*，见宏定义）：
+	 *   ① 一次样本都没采到（bat_count == 0）
+	 *      → ADC 通道本身坏了，不是电池的问题，报 UNKNOWN
+	 *   ② 中值电压换回 BAT 端后 < BAT_ADC_MIN_VALID_MV（1500mV）
+	 *      → 分压脚没有有效电平：没接电池、或者分压电阻/走线断了
+	 *        报 DISCONNECTED，bat_mv 置 0
+	 *   ③ 电压 > BAT_ADC_MAX_VALID_MV（5000mV）
+	 *      → 单节锂电不可能到 5V 以上，多半是基准漂了或采样脚短路到 VBUS
+	 *        报 OVERRANGE，bat_mv 置 0（宁可不显示也不显示错的）
+	 *   ④ 落在区间内 → OK，bat_mv 用实测值
 	 */
-	if (bat_count > 0U) {
-		uint32_t raw = bat_sum / bat_count;
-		uint32_t bat = (raw * BAT_ADC_DIVIDER_NUM) / BAT_ADC_DIVIDER_DEN;
+	if (bat_count == 0U) {
+		capture->bat_detect = BAT_DETECT_UNKNOWN;
+	} else if (bat_raw > 0U) {
+		uint32_t bat = (bat_raw * BAT_ADC_DIVIDER_NUM) / BAT_ADC_DIVIDER_DEN;
 
-		capture->bat_raw_mv = (uint16_t)MIN(raw, 0xFFFFU);
+		capture->bat_raw_mv = (uint16_t)MIN(bat_raw, 0xFFFFU);
 		if (bat >= BAT_ADC_MIN_VALID_MV && bat <= BAT_ADC_MAX_VALID_MV) {
 			capture->bat_mv = (uint16_t)bat;
+			capture->bat_detect = BAT_DETECT_OK;
+		} else if (bat > BAT_ADC_MAX_VALID_MV) {
+			capture->bat_detect = BAT_DETECT_OVERRANGE;
+		} else {
+			capture->bat_detect = BAT_DETECT_DISCONNECTED;
 		}
+	} else {
+		capture->bat_detect = BAT_DETECT_DISCONNECTED;
 	}
 
 	/*
@@ -2055,7 +2167,8 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	LOG_INF("temp=%d.%02dC ntc=%uohm adc=%umV vdd=%umV samples=%u", ntc->temp_centi / 100,
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
-	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
+	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u detect=%s", ntc->bat_raw_mv, ntc->bat_mv,
+		soc, bat_detect_name(ntc->bat_detect));
 	LOG_INF("vbus=%umV -> 0x0C 填 %umV(0.001V档)  charge_state=%u  "
 		"0x4A 填 %u(0.1V档,=%umV)",
 		ntc->vbus_mv, ntc->vbus_in_mv, ntc->charge_state,
