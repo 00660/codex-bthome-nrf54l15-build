@@ -805,9 +805,12 @@ static int ip5328_key_press(uint32_t ms)
  * 把两根线当纯输入挂一会儿，数它们自己跳变了几次。
  *
  * 这一格是用来区分两种"完全不应答"的：
- *   有跳变 → 这两个脚上另有主机在跑 I2C（比如接错到了 IP5328 的
- *            I2C1 主机口 L1/L2），模组插进去只是第三个主机，谁都不理谁；
+ *   有跳变 → 这两个脚上另有主机在跑 I2C（板上有别的 MCU 在轮询 IP5328，
+ *            或者接错到了 IP5328 的 I2C1 主机口 L1/L2），
+ *            模组插进去只是第二个主机，谁都不理谁；
  *   没跳变 → 线上真的什么都没发生，是 IP5328 没进从机模式。
+ *
+ * 挂满约 1 秒：板上的轮询周期可能是几百毫秒，只听 20ms 很容易漏掉。
  */
 static void ip_listen(uint8_t *scl_edges, uint8_t *sda_edges)
 {
@@ -823,7 +826,7 @@ static void ip_listen(uint8_t *scl_edges, uint8_t *sda_edges)
 	last_scl = gpio_pin_get(ip_port, IP5328_PIN_M5);
 	last_sda = gpio_pin_get(ip_port, IP5328_PIN_M6);
 
-	for (uint32_t i = 0U; i < 20000U; i++) {
+	for (uint32_t i = 0U; i < 500000U; i++) {
 		int scl = gpio_pin_get(ip_port, IP5328_PIN_M5);
 		int sda = gpio_pin_get(ip_port, IP5328_PIN_M6);
 
@@ -918,8 +921,8 @@ static void ip_line_probe(uint32_t pin, uint8_t *low_release, uint8_t *high_rele
  *   [16]    慢速首个命中地址（7bit）
  *   [17]    INT(P1.04) 纯高阻时的电平
  *   [18]    INT(P1.04) 加内部上拉时的电平
- *   [19]    按 KEY 之前，20ms 内 SCL 自己跳变了几次（饱和 255）
- *   [20]    按 KEY 之前，20ms 内 SDA 自己跳变了几次（饱和 255）
+ *   [19]    按 KEY 之前，约 1 秒内 SCL 自己跳变了几次（饱和 255）
+ *   [20]    按 KEY 之前，约 1 秒内 SDA 自己跳变了几次（饱和 255）
  *   [21]    按 KEY 之后 probe 0x75 的结果，0 = 收到 ACK，0xFF = 没测
  *   [22]    按 KEY 之后 INT(P1.04) 加内部上拉时的电平
  *   [23]    按 KEY 之后快速全地址扫描命中数
