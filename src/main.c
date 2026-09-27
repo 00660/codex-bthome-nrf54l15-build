@@ -493,8 +493,8 @@ static bool bat_adc_ready;
 static bool vbus_adc_ready;
 static int16_t adc_sample_buffer[2];
 
-/* 最近一次 ADC 兜底测到的电池电压（mV）—— 电量百分比的查表在下面，先声明 */
-static uint8_t battery_percent_from_mv(uint16_t mv);
+/* 电池电压(mV) → 电量百分比，查 soc_table[] 放电曲线。实现在下面 */
+static uint8_t soc_from_mv(uint16_t mv);
 
 /*
  * 充电状态推断：一个窗口内把每个采样点都累加，到点取平均再和上一个
@@ -837,36 +837,6 @@ static int ip5328_ensure_bind(void)
 	}
 
 	return -ENODEV;
-}
-
-static uint8_t soc_from_mv(uint16_t mv)
-{
-	const size_t last = ARRAY_SIZE(soc_table) - 1U;
-
-	if (mv >= soc_table[0].mv) {
-		return soc_table[0].pct;
-	}
-	if (mv <= soc_table[last].mv) {
-		return soc_table[last].pct;
-	}
-
-	for (size_t i = 0; i < last; i++) {
-		uint16_t hi_mv = soc_table[i].mv;
-		uint16_t lo_mv = soc_table[i + 1].mv;
-
-		if (mv <= hi_mv && mv >= lo_mv) {
-			uint16_t span = hi_mv - lo_mv;
-			uint16_t offset = hi_mv - mv;
-			int32_t hi_pct = soc_table[i].pct;
-			int32_t lo_pct = soc_table[i + 1].pct;
-			int32_t pct = hi_pct + ((lo_pct - hi_pct) * (int32_t)offset + (int32_t)span / 2) /
-						       (int32_t)span;
-
-			return (uint8_t)CLAMP(pct, 0, 100);
-		}
-	}
-
-	return 0U;
 }
 
 static int ip5328_read_registers(struct ip5328_data *d)
@@ -1457,7 +1427,7 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 					     (ntc->charge_state == BAT_STATE_CHARGING ? 0x10U : 0U) |
 					     (ntc->charge_state == BAT_STATE_FULL ? 0x40U : 0U));
 		ip5328_report[2] = (uint8_t)(ntc->charge_state & 0x07U);
-		ip5328_report[3] = battery_percent_from_mv(ntc->bat_mv);
+		ip5328_report[3] = soc_from_mv(ntc->bat_mv);
 		sys_put_le16(ntc->bat_mv, &ip5328_report[4]);
 		sys_put_le16(ntc->bat_raw_mv, &ip5328_report[6]);
 		sys_put_le16(ntc->vbus_mv, &ip5328_report[8]);
@@ -1533,7 +1503,7 @@ static void put_s16_le(uint8_t *dst, int32_t value)
  * 电池电压 → 电量百分比。
  *
  * 用 soc_table[] 这条锂电池放电曲线（4.35V 满充 → 3.3V 空）线性插值，
- * 而不是拿 BATTERY_FULL_MV/BATTERY_EMPTY_MV 做两点直线。
+ * 而不是拿两点做直线。
  *
  * 为什么必须查表：锂电池的放电曲线是**中间很平、两头很陡**的。
  * 4.0~3.7V 这一段占了大概 60% 的容量，但电压只差 300mV。用两点直线的话，
@@ -1541,43 +1511,39 @@ static void put_s16_le(uint8_t *dst, int32_t value)
  *
  * 另外要清楚：**光靠电压永远推不出准确电量**。同样的 3.8V，空载静置
  * 可能是 45%，带载放电时可能是 25%。所以这里给的是"静置开压估计值"，
- * 只有在电池静置、没有大电流时才比较可信。
+ * 只有在电池静置、没有大电流时才比较可信。要精确得靠库仑计。
  *
  * 之前那个实现是 mv>=3000 就直接返回 100，而实测电池 4130mV，
  * 所以永远报 100% —— 现在改成查表，4130mV 大约落到 83%。
+ *
+ * IP5328 I2C 那条路（d->batocv_mv）和 ADC 兜底这条路（ADC 测到的 bat_mv）
+ * 共用这一个函数，保证两条路给出的百分比口径一致。
  */
-static uint8_t battery_percent_from_mv(uint16_t mv)
+static uint8_t soc_from_mv(uint16_t mv)
 {
-	size_t n = ARRAY_SIZE(soc_table);
+	const size_t last = ARRAY_SIZE(soc_table) - 1U;
 
 	if (mv >= soc_table[0].mv) {
 		return soc_table[0].pct;
 	}
-
-	if (mv <= soc_table[n - 1U].mv) {
-		return soc_table[n - 1U].pct;
+	if (mv <= soc_table[last].mv) {
+		return soc_table[last].pct;
 	}
 
 	/* 表是按电压降序排的，找到 mv 落在哪两个点之间 */
-	for (size_t i = 0U; i + 1U < n; i++) {
+	for (size_t i = 0; i < last; i++) {
 		uint16_t hi_mv = soc_table[i].mv;
-		uint16_t lo_mv = soc_table[i + 1U].mv;
+		uint16_t lo_mv = soc_table[i + 1].mv;
 
 		if (mv <= hi_mv && mv >= lo_mv) {
-			uint8_t hi_pct = soc_table[i].pct;
-			uint8_t lo_pct = soc_table[i + 1U].pct;
-			uint32_t span_mv = (uint32_t)(hi_mv - lo_mv);
-			uint32_t offset = (uint32_t)(hi_mv - mv);
+			uint16_t span = hi_mv - lo_mv;
+			uint16_t offset = hi_mv - mv;
+			int32_t hi_pct = soc_table[i].pct;
+			int32_t lo_pct = soc_table[i + 1].pct;
+			int32_t pct = hi_pct + ((lo_pct - hi_pct) * (int32_t)offset + (int32_t)span / 2) /
+						       (int32_t)span;
 
-			/* pct = hi_pct - (hi_pct - lo_pct) * offset / span，四舍五入 */
-			uint32_t drop = (uint32_t)(hi_pct - lo_pct) * offset;
-
-			if (span_mv == 0U) {
-				return hi_pct;
-			}
-
-			return (uint8_t)((uint32_t)hi_pct -
-					 (drop + span_mv / 2U) / span_mv);
+			return (uint8_t)CLAMP(pct, 0, 100);
 		}
 	}
 
@@ -1976,10 +1942,10 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		 * 这是兜底：只有电压，没有电流/功率/充电状态。
 		 */
 		volt_mv = ntc->bat_mv;
-		soc = battery_percent_from_mv(volt_mv);
+		soc = soc_from_mv(volt_mv);
 	} else {
 		/* 分压也没接，只能拿模组自己的供电电压充数（不是电池电压） */
-		soc = battery_percent_from_mv(ntc->vdd_mv);
+		soc = soc_from_mv(ntc->vdd_mv);
 		volt_mv = ntc->vdd_mv;
 	}
 
