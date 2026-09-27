@@ -16,7 +16,7 @@
 	};
 
 	zephyr,user {
-		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>, <&adc 4>;
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>;
 	};
 };
 
@@ -76,12 +76,12 @@
 	};
 
 	/*
-	 * 电池电压：模组第 4 脚 = P1.12 = AIN5。
-	 * IP5328 的 I2C 读不到数据时的兜底数据源 —— 外部分压后接进来。
+	 * 电池电压：模组第 4 脚 = P1.12 = AIN5，外部 1M+1M 分压后接进来。
+	 *
 	 * nRF54L15 的 SAADC 只有 AIN0~AIN7 这 8 个脚能当模拟输入：
 	 *   AIN0=P1.04 AIN1=P1.05 AIN2=P1.06 AIN3=P1.07
 	 *   AIN4=P1.11 AIN5=P1.12 AIN6=P1.13 AIN7=P1.14
-	 * P1.11 已经被 NTC 占了，P1.13/P1.14 被 I2C 占了，所以选 P1.12。
+	 * P1.11 被 NTC 占了，P1.14 被 VBUS 占了，所以电池电压选 P1.12。
 	 */
 	channel@2 {
 		reg = <2>;
@@ -94,21 +94,23 @@
 	};
 
 	/*
-	 * 充电器输入 VBUS：模组第 7 脚 = P1.04 = AIN0。
+	 * 充电器输入 VBUS：模组第 6 脚 = P1.14 = AIN7。
 	 * 用来直接判断"插没插充电器"，比靠电池电压斜率猜靠谱得多。
 	 *
-	 *   充电输入 5V ──[1MΩ]──┬── 模组第 7 脚
-	 *                        └──[150kΩ]── GND      （再并一颗电容到 GND）
+	 *   充电输入 5V ──[1MΩ]──┬── 模组第 6 脚
+	 *                        └──[100kΩ]── GND     （再并一颗电容到 GND）
 	 *
-	 * 分压比约 7.67:1：5V→0.65V，9V→1.17V，12V→1.56V，20V→2.61V，
-	 * 全部落在 SAADC 的 3.6V 满量程内。
+	 * 分压比约 11:1：5V→0.45V，9V→0.82V，12V→1.09V，20V→1.82V，
+	 * 全部落在 SAADC 的 3.6V 满量程内，余量很大。
 	 *
-	 * 为什么用 7 脚而不是 16 脚：模组 5/6/7 这三个模拟脚现在都空着
-	 * （5/6 原来是 I2C，7 原来是 IP5328 的 INT），7 脚紧挨着已经焊好的
-	 * 4 脚（电池）和 8 脚（KEY），接线最顺手。16 脚反而在别处。
+	 * 为什么用 6 脚而不是 16 脚：模组 5/6/7 这三个模拟脚现在都空着
+	 * （5/6 原来是 I2C，7 原来是 IP5328 的 INT），6 脚就在已经焊好的
+	 * 4 脚（电池）旁边，接线最顺手。16 脚当初只是因为 5/6/7 都被占了
+	 * 才选的，现在没必要。
 	 *
-	 * 没接线时这一脚悬空，读数会乱飘，固件里有两道闸门拦它
-	 * （区间 + 窗口内跳动量），见 src/main.c 的 VBUS_ADC_ENABLE。
+	 * 拔掉充电器时这一脚被 100k 拉到地（0V）。就算线没接/虚焊，固件里
+	 * 还有两道闸门拦着（区间 + 窗口内跳动量），见 src/main.c 的
+	 * VBUS_ADC_ENABLE。
 	 */
 	channel@3 {
 		reg = <3>;
@@ -116,41 +118,7 @@
 		zephyr,reference = "ADC_REF_INTERNAL";
 		zephyr,vref-mv = <900>;
 		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
-		zephyr,input-positive = <NRF_SAADC_AIN0>;
-		zephyr,resolution = <12>;
-	};
-
-	/*
-	 * 电池电流：差分输入。
-	 *   正输入 = AIN6 = P1.13 = 模组第 5 脚
-	 *   负输入 = AIN7 = P1.14 = 模组第 6 脚
-	 *
-	 * 采样电阻是板子上已有的那颗（IP5328 的 24 脚 VSP / 25 脚 VSN 之间），
-	 * 不用自己加、不用割线。两端各拉一路 1M/1M 分压到地：
-	 *
-	 *   VSP(24) ──[1M]──┬── 模组 5 脚
-	 *                   └──[1M]── GND
-	 *   VSN(25) ──[1M]──┬── 模组 6 脚
-	 *                   └──[1M]── GND
-	 *
-	 * 分压是必须的：VSP/VSN 坐在 VSYS 上（3~4.2V），直接进 ADC 会超过
-	 * 模组 VDD(3.3V) 的绝对最大额定值。分压后共模降到 1.5~2.1V。
-	 *
-	 * 只要写了 input-negative，ADC 层就自动置 differential=true
-	 * （见 Zephyr 的 ADC_CHANNEL_CFG_FROM_DT），驱动会配成差分模式。
-	 *
-	 * 增益 4：满量程 ±0.9/4 = ±0.225V，12bit 差分 → 约 0.11mV/LSB。
-	 * 采样电阻 10mΩ、电流 2A → 采样电阻上 20mV → 分压后 10mV → 约 91 个码。
-	 * 电阻失配造成的零点偏置（1% 约 21mV）靠固件里的 SHUNT_OFFSET_MV 减掉。
-	 */
-	channel@4 {
-		reg = <4>;
-		zephyr,gain = "ADC_GAIN_4";
-		zephyr,reference = "ADC_REF_INTERNAL";
-		zephyr,vref-mv = <900>;
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
-		zephyr,input-positive = <NRF_SAADC_AIN6>;
-		zephyr,input-negative = <NRF_SAADC_AIN7>;
+		zephyr,input-positive = <NRF_SAADC_AIN7>;
 		zephyr,resolution = <12>;
 	};
 

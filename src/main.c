@@ -3,20 +3,21 @@
  * ---------------------------------------------------------------------
  * 传感器（纯 ADC 路线，不用 I2C）
  *   1. 100k NTC 分压测温（模组 2 脚供电 / 模组 3 脚 = P1.11 AIN4 采样）
- *   2. 电池电压（模组 4 脚 = P1.12 AIN5，外部 1:1 分压）
- *   3. 充电器输入 VBUS（模组 7 脚 = P1.04 AIN0）—— 充电状态的可靠依据
- *   4. 充电状态：由电池电压的变化方向推断（没有 I2C 时的唯一办法）
+ *   2. 电池电压（模组 4 脚 = P1.12 AIN5，外部 1M+1M 分压）
+ *   3. 充电器输入 VBUS（模组 6 脚 = P1.14 AIN7，外部 1M+100k 分压）
+ *      —— 充电状态的可靠依据，插拔立刻就能判出来
+ *   4. 充电状态：VBUS 为主，电池电压斜率兜底
  *
  * IP5328 的 I2C 那套（模组 5/6/7 脚）代码还在，但默认关掉了 ——
  * 见 IP5328_I2C_ENABLE。关掉之后开机不用等 30 秒静默期、不跑总线诊断，
- * P1.13 / P1.14 / P1.04 都保持高阻。
+ * P1.13 / P1.04 都保持高阻（P1.14 现在给 VBUS 用）。
  *
  * 引脚（E73 模组脚 → nRF54L15）
  *   2  → P1.10   NTC 分压供电（只在采样时给电）
  *   3  → P1.11   电池/NTC ADC (AIN4)
- *   4  → P1.12   电池电压 ADC (AIN5)，外部分压
+ *   4  → P1.12   电池电压 ADC (AIN5)，外部 1M+1M 分压
+ *   6  → P1.14   充电器输入 VBUS ADC (AIN7)，外部 1M+100k 分压
  *   8  → P1.02   IP5328 KEY 网络（NFC1，overlay 里已关 NFC）—— 按键唤醒
- *   7  → P1.04   充电器输入 VBUS ADC (AIN0)，外部分压
  *
  * 运行策略（双唤醒 + 轮询 OTA 窗口）
  *   唤醒源 1：定时，每 10 分钟一轮（原机制，保留）
@@ -60,18 +61,18 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BTHOME_ID_BATTERY 0x01
 #define BTHOME_ID_TEMPERATURE 0x02
 #define BTHOME_ID_VOLTAGE 0x0C
-#define BTHOME_ID_CURRENT_SIGNED 0x5D
 #define BTHOME_ID_FIRMWARE_VERSION 0xF2
 
 /*
  * BTHome 要求 object id 按数值从小到大排列，接收端碰到不认识的 id
- * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < 5D < F2。
+ * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < F2。
+ *
+ * 电流对象（0x5D）已经摘掉 —— 这块板子拿去给别的设备供电，不需要采电流。
  */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
 #define BTHOME_VOLTAGE_OFFSET 9U
-#define BTHOME_CURRENT_OFFSET 12U
-#define BTHOME_VERSION_OFFSET 15U
+#define BTHOME_VERSION_OFFSET 12U
 
 /* ---------------- NTC ---------------- */
 
@@ -140,84 +141,42 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 /* ---------------- 充电器输入 VBUS（充电状态的可靠来源） ---------------- */
 
 /*
- * 模组第 7 脚 = P1.04 = AIN0。这是判断"插没插充电器"最靠谱的一路 ——
+ * 模组第 6 脚 = P1.14 = AIN7。这是判断"插没插充电器"最靠谱的一路 ——
  * 直接看充电输入有没有电，是数字信号，不用猜。
  *
- *   充电输入 5V ──[1MΩ]──┬── 模组第 7 脚
- *   （或 VIN(30) 脚、USB 口的 5V）└──[150kΩ]── GND      分压约 7.67:1
+ *   充电输入 5V ──[1MΩ]──┬── 模组第 6 脚 (P1.14/AIN7)
+ *   （或 VIN(30) 脚、USB 口的 5V）└──[100kΩ]── GND     分压约 11:1
  *                                  （再并一颗电容到 GND）
  *
- * 5V → 0.65V，9V → 1.17V，12V → 1.56V，20V → 2.61V，都在满量程内。
+ * 11:1 下的换算：5V → 0.45V，9V → 0.82V，12V → 1.09V，20V → 1.82V，
+ * 全部落在 SAADC 满量程（3.6V）内，余量很大。
  *
- * 为什么用 7 脚：模组 5/6/7 三个模拟脚现在都空着（5/6 原来是 I2C，
- * 7 原来是 IP5328 的 INT），7 脚紧挨着已焊好的 4 脚（电池）和 8 脚（KEY），
- * 接线最顺手。16 脚当初只是因为 5/6/7 都被占了才选的，现在没必要。
+ * 为什么用 6 脚：模组 5/6/7 三个模拟脚现在都空着（5/6 原来是 I2C，
+ * 7 原来是 IP5328 的 INT）。6 脚就在已焊好的 4 脚（电池）旁边，接线最顺手。
+ * 16 脚当初只是因为 5/6/7 都被占了才选的，现在没必要。
  *
  * ★ 现在置 1：接上分压就能用。
- *   没接线时这一脚悬空，读数会乱飘 —— 所以下面有两道闸门拦它：
+ *   拔掉充电器时这一脚被 100k 拉到地（0V），接上就是 0.45V 以上。
+ *   即便如此，下面还是留两道闸门防意外（线没接/虚焊时脚会飘）：
  *     ① 读数必须落在 [250mV, 2800mV] 区间内
  *     ② 一个采样窗口内最大最小值之差不能超过 30mV（真 VBUS 很稳，悬空脚会飘）
  *   两道都过才算"插着充电器"，否则报 0。这样即使线没接也不会误报。
  */
 #define VBUS_ADC_ENABLE 1
 #define VBUS_ADC_MIN_PRESENT_MV 250U
-/* 7.67:1 下 2800mV 对应输入 21.5V，再高就超出任何合法快充档位了 */
+/* 11:1 下 2800mV 对应输入 30.8V，比任何合法快充档位都高，够宽松了 */
 #define VBUS_ADC_MAX_PLAUSIBLE_MV 2800U
 /* 窗口内跳动超过这么多就认定是悬空脚在飘，不是真 VBUS */
 #define VBUS_ADC_MAX_RIPPLE_MV 30U
 
-/* ---------------- 电池电流（差分 ADC，可选接线） ---------------- */
+/* ---------------- 电池电流：已取消 ---------------- */
 
 /*
- * 采样电阻是板子上【已有】的那颗 —— IP5328 的 24 脚 VSP / 25 脚 VSN 之间。
- * 不用自己加，也不用割线。
- *
- *   VSP(24) ──[1MΩ]──┬── 模组 5 脚 (P1.13 / AIN6)   正输入
- *                    └──[1MΩ]── GND
- *   VSN(25) ──[1MΩ]──┬── 模组 6 脚 (P1.14 / AIN7)   负输入
- *                    └──[1MΩ]── GND
- *
- * 为什么要分压：VSP/VSN 坐在 VSYS 上（3.0~4.2V），直接进 ADC 脚会超过
- * 模组 VDD(3.3V) 的绝对最大额定值。分压后共模降到 1.5~2.1V。
- *
- *   I = (正输入 − 负输入) × 分压比 ÷ 采样电阻
- *   分压比 = (1M + 1M) / 1M = 2
- *
- * 为什么 1M 而不是 100k：误差主要来自两颗电阻的【失配】（1% 失配 →
- * 约 21mV 固定偏置），跟阻值绝对值无关；而 1M 的静态电流只有 2.1µA/路
- * （两条腿共 4.2µA），不毁待机。这个偏置靠下面的 SHUNT_OFFSET_MV 减掉。
- *
- * 没接线时置 0，就不会去采样，报告里 [12:16] 恒为 0。
- *
- * ★ 现在置 0：这块板子拿去给别的设备供电，不需要采电流。
- *   代码留着，接线接回来再把这里改成 1 就恢复。
- *   关掉之后模组 5/6 脚（P1.13/P1.14）重新空出来，配成纯高阻。
+ * 这块板子拿去给别的设备供电，不需要采电流，所以整条差分电流通道删掉了。
+ * 模组第 6 脚（P1.14 / AIN7）现在归 VBUS 用，也没有第二只脚能凑成差分对。
+ * 原来那套接线（采样电阻用 IP5328 的 24 脚 VSP / 25 脚 VSN，两端各
+ * 1M+1M 分压到 AIN6/AIN7）记在 README 里，真要恢复照着接就行。
  */
-#define SHUNT_ADC_ENABLE 0
-#define SHUNT_DIVIDER_NUM 2U
-#define SHUNT_DIVIDER_DEN 1U
-
-/*
- * 采样电阻阻值（毫欧）。IP5328 手册没给，常见 5 或 10mΩ。
- * 先按 10 算。标定：挂一个已知负载，看报告包 [12:14] 的差分 mV，
- * 真实阻值 = 差分mV × 分压比 ÷ 电流(A)。
- */
-#define SHUNT_MILLIOHM 10U
-
-/*
- * 零点偏置（分压后的 mV，有符号）。空载时读到的那个固定值，
- * 由两颗 1M 的失配造成。标定：不充不放时读 [12:14]，填到这里。
- */
-#define SHUNT_OFFSET_MV 0
-
-/* 换算出来的电流超过这个数就认为读数不可信，报 0 */
-#define SHUNT_MAX_ABS_MA 15000
-
-/*
- * 电流方向。模组 5/6 脚接反了（正负对调）就把这里改成 1，
- * 不用拆线重焊。改完充电时应该读正、放电时读负。
- */
-#define SHUNT_INVERT 0
 
 #define BATTERY_FULL_MV 3000U
 #define BATTERY_EMPTY_MV 2200U
@@ -251,7 +210,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 置 0 就完全不碰 I2C：
  *   - 不探测、不跑总线诊断、不按键
  *   - 开机不用再等 30 秒静默期
- *   - P1.13 / P1.14 / P1.04 全部保持高阻
+ *   - P1.13 / P1.04 保持高阻（P1.14 现在归 VBUS 用）
  *
  * 代码全都留着，哪天把线接回去（并且确认上拉挂在 IP5328 第 27 脚 VREG 上），
  * 把这里改成 1 就恢复。
@@ -373,13 +332,10 @@ struct ntc_capture {
 	/* 模组第 4 脚 (P1.12/AIN5) 分压后测到的电池电压，已换算回 BAT 端 */
 	uint16_t bat_mv;
 	uint16_t bat_raw_mv;
-	/* 模组第 7 脚 (P1.04/AIN0) 分压后测到的充电器输入电压（未换算回 VBUS 端） */
+	/* 模组第 6 脚 (P1.14/AIN7) 分压后测到的充电器输入电压（未换算回 VBUS 端） */
 	uint16_t vbus_mv;
 	/* 充电状态，见 BAT_STATE_* */
 	uint8_t charge_state;
-	/* 电池电流：差分测到的分压后电压（有符号 mV），和按假定采样电阻算出的 mA */
-	int16_t shunt_mv;
-	int16_t shunt_ma;
 };
 
 struct soc_point {
@@ -450,7 +406,6 @@ static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_
 static const struct adc_dt_spec vdd_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
 static const struct adc_dt_spec bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 2);
 static const struct adc_dt_spec vbus_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 3);
-static const struct adc_dt_spec shunt_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 4);
 static const struct gpio_dt_spec ntc_power = GPIO_DT_SPEC_GET(DT_ALIAS(ntcpower), gpios);
 static const struct device *const ip_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
@@ -486,7 +441,6 @@ static bool connected;
 static bool vdd_adc_ready;
 static bool bat_adc_ready;
 static bool vbus_adc_ready;
-static bool shunt_adc_ready;
 static int16_t adc_sample_buffer[2];
 
 /* 最近一次 ADC 兜底测到的电池电压（mV）—— 电量百分比的查表在下面，先声明 */
@@ -535,7 +489,6 @@ static bool diag_from_key;
  *   01 BB         battery，uint8，%
  *   02 TT TT      temperature，sint16，0.01 °C
  *   0C VV VV      voltage，uint16，0.001 V
- *   5D CC CC      current (signed)，sint16，0.001 A，充正放负
  *   F2 PP MM JJ   firmware version，patch/minor/major
  */
 static uint8_t bthome_service_data[] = {
@@ -548,9 +501,6 @@ static uint8_t bthome_service_data[] = {
 	0x00,
 	0x00,
 	BTHOME_ID_VOLTAGE,
-	0x00,
-	0x00,
-	BTHOME_ID_CURRENT_SIGNED,
 	0x00,
 	0x00,
 	BTHOME_ID_FIRMWARE_VERSION,
@@ -1437,8 +1387,7 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 		 *   [6:8]   分压后、换算前的原始 mV（1:1 分压时是电池电压的一半）
 		 *   [8:10]  充电器输入 VBUS 分压后的 mV，0 = 没插
 		 *   [10:12] 充电状态（和 [1] bit0~2 同值）
-		 *   [12:14] 电池电流差分值换算回采样电阻上的 mV（有符号）
-		 *   [14:16] 电池电流 mA（有符号，按 SHUNT_MILLIOHM 换算）
+		 *   [12:16] 保留未用，恒 0（电流通道已取消）
 		 */
 		memset(ip5328_report, 0, sizeof(ip5328_report));
 		ip5328_report[0] = IP5328_REPORT_ADC_FALLBACK;
@@ -1451,8 +1400,6 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 		sys_put_le16(ntc->bat_raw_mv, &ip5328_report[6]);
 		sys_put_le16(ntc->vbus_mv, &ip5328_report[8]);
 		sys_put_le16(ntc->charge_state, &ip5328_report[10]);
-		sys_put_le16((uint16_t)ntc->shunt_mv, &ip5328_report[12]);
-		sys_put_le16((uint16_t)ntc->shunt_ma, &ip5328_report[14]);
 		return;
 	}
 
@@ -1600,19 +1547,7 @@ static int configure_adc(void)
 	if (VBUS_ADC_ENABLE && adc_is_ready_dt(&vbus_adc) && adc_channel_setup_dt(&vbus_adc) == 0) {
 		vbus_adc_ready = true;
 	} else if (VBUS_ADC_ENABLE) {
-		LOG_WRN("VBUS ADC (模组 7 脚 / P1.04 / AIN0) 不可用，充电器插入检测关闭");
-	}
-
-	/*
-	 * 电池电流差分通道。模组 5/6 脚（P1.13/P1.14）之前是 IP5328 的 I2C，
-	 * 现在改成电流采样用 —— configure_ip5328_io() 先跑，把那两脚放成高阻，
-	 * 这里再由 SAADC 接管成模拟输入。
-	 */
-	shunt_adc_ready = false;
-	if (SHUNT_ADC_ENABLE && adc_is_ready_dt(&shunt_adc) && adc_channel_setup_dt(&shunt_adc) == 0) {
-		shunt_adc_ready = true;
-	} else if (SHUNT_ADC_ENABLE) {
-		LOG_WRN("电流差分 ADC (模组 5/6 脚 / AIN6-AIN7) 不可用，电流读数关闭");
+		LOG_WRN("VBUS ADC (模组 6 脚 / P1.14 / AIN7) 不可用，充电器插入检测关闭");
 	}
 
 	return 0;
@@ -1690,7 +1625,7 @@ static uint32_t ntc_resistance_ohms(uint32_t adc_mv, uint32_t vdd_mv)
  *
  * 两种信息源，VBUS 优先：
  *
- *   ① 模组第 7 脚 VBUS 有没有电 —— 直接、可靠、不猜。有电就是插着充电器。
+ *   ① 模组第 6 脚 VBUS 有没有电 —— 直接、可靠、不猜。有电就是插着充电器。
  *   ② 电池电压往哪边走 —— 兜底。窗口内每点累加，到点取平均再和上个窗口比。
  *
  * 只看 ② 是不靠谱的：实测电池读数在 4124~4140 之间跳（峰峰值 16mV），
@@ -1789,15 +1724,12 @@ static int sample_ntc(struct ntc_capture *capture)
 	uint16_t vbus_count = 0;
 	uint16_t vbus_min = UINT16_MAX;
 	uint16_t vbus_max = 0;
-	uint32_t shunt_sum = 0;
-	uint16_t shunt_count = 0;
 	uint16_t adc_min = UINT16_MAX;
 	uint16_t adc_max = 0;
 	int32_t adc_mv;
 	int32_t vdd_mv;
 	int32_t bat_mv;
 	int32_t vbus_mv;
-	int32_t shunt_mv;
 	int last_error = -EIO;
 	int ret;
 
@@ -1847,15 +1779,6 @@ static int sample_ntc(struct ntc_capture *capture)
 				vbus_count++;
 				vbus_min = MIN(vbus_min, v);
 				vbus_max = MAX(vbus_max, v);
-			}
-		}
-
-		if (shunt_adc_ready) {
-			ret = read_adc_mv(&shunt_adc, &shunt_mv);
-			if (ret == 0) {
-				/* 有符号，负值也要保留，所以先整体抬到正区间再累加 */
-				shunt_sum += (uint32_t)(shunt_mv + 32768);
-				shunt_count++;
 			}
 		}
 
@@ -1912,34 +1835,6 @@ static int sample_ntc(struct ntc_capture *capture)
 		}
 	}
 
-	/*
-	 * 电池电流：差分平均值 → 减零点偏置 → 还原到采样电阻上 → 除以阻值。
-	 *
-	 *   mV(采样电阻上) = (差分mV − 偏置) × 分压比
-	 *   mA = mV / 毫欧          （mV ÷ mΩ = A，×1000 就是 mA）
-	 */
-	if (shunt_count > 0U) {
-		int32_t avg = (int32_t)(shunt_sum / shunt_count) - 32768;
-		int32_t on_shunt_mv;
-		int32_t ma;
-
-		if (SHUNT_INVERT) {
-			avg = -avg;
-		}
-
-		on_shunt_mv = (avg - SHUNT_OFFSET_MV) * (int32_t)SHUNT_DIVIDER_NUM /
-			      (int32_t)SHUNT_DIVIDER_DEN;
-		ma = on_shunt_mv * 1000 / (int32_t)SHUNT_MILLIOHM;
-
-		if (ma > SHUNT_MAX_ABS_MA || ma < -SHUNT_MAX_ABS_MA) {
-			ma = 0; /* 读数不可信（多半是线没接好），别报出去吓人 */
-			on_shunt_mv = 0;
-		}
-
-		capture->shunt_mv = (int16_t)CLAMP(on_shunt_mv, INT16_MIN, INT16_MAX);
-		capture->shunt_ma = (int16_t)CLAMP(ma, INT16_MIN, INT16_MAX);
-	}
-
 	bat_update_charge_state(capture->bat_mv, capture->vbus_mv != 0U);
 	capture->charge_state = bat_charge_state;
 
@@ -1984,7 +1879,6 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	bthome_service_data[BTHOME_VERSION_OFFSET] = APP_PATCHLEVEL;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 1U] = APP_VERSION_MINOR;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 2U] = APP_VERSION_MAJOR;
-	put_s16_le(&bthome_service_data[BTHOME_CURRENT_OFFSET], ip->valid ? ip->bat_ma : ntc->shunt_ma);
 
 	ip5328_encode_report(ip, ntc);
 
@@ -1993,7 +1887,6 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
 	LOG_INF("vbus=%umV charge_state=%u", ntc->vbus_mv, ntc->charge_state);
-	LOG_INF("shunt on_shunt=%dmV i=%dmA", ntc->shunt_mv, ntc->shunt_ma);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
