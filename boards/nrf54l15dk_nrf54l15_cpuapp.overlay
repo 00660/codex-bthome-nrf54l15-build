@@ -16,7 +16,7 @@
 	};
 
 	zephyr,user {
-		io-channels = <&adc 0>, <&adc 1>;
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>;
 	};
 };
 
@@ -72,6 +72,24 @@
 		zephyr,vref-mv = <900>;
 		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
 		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <12>;
+	};
+
+	/*
+	 * 电池电压：模组第 4 脚 = P1.12 = AIN5。
+	 * IP5328 的 I2C 读不到数据时的兜底数据源 —— 外部分压后接进来。
+	 * nRF54L15 的 SAADC 只有 AIN0~AIN7 这 8 个脚能当模拟输入：
+	 *   AIN0=P1.04 AIN1=P1.05 AIN2=P1.06 AIN3=P1.07
+	 *   AIN4=P1.11 AIN5=P1.12 AIN6=P1.13 AIN7=P1.14
+	 * P1.11 已经被 NTC 占了，P1.13/P1.14 被 I2C 占了，所以选 P1.12。
+	 */
+	channel@2 {
+		reg = <2>;
+		zephyr,gain = "ADC_GAIN_1_4";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,vref-mv = <900>;
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN5>;
 		zephyr,resolution = <12>;
 	};
 

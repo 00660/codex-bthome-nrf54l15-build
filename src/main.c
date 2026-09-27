@@ -3,11 +3,14 @@
  * ---------------------------------------------------------------------
  * 传感器
  *   1. 100k NTC 分压测温（P1.10 供电 / P1.11 AIN4 采样）
- *   2. IP5328 移动电源 SOC 的 I2C 数据（电池电压/电流/功率/充电状态/电量）
+ *   2. 电池电压 ADC 兜底（模组 4 脚 = P1.12 AIN5，外部 1:1 分压）
+ *   3. IP5328 移动电源 SOC 的 I2C 数据（电池电压/电流/功率/充电状态/电量）
  *      —— 软件 bit-bang I2C 挂在 P1.13 / P1.14，接线顺序写死：
  *         模组 5 脚 = SCL，模组 6 脚 = SDA
+ *      I2C 通了就用 IP5328 的 14bit ADC 数据，不通就用上面那路 ADC 兜底。
  *
  * 引脚（E73 模组脚 → nRF54L15）
+ *   4  → P1.12   电池电压 ADC (AIN5)，外部分压
  *   5  → P1.13   IP5328 I2C SCL
  *   6  → P1.14   IP5328 I2C SDA
  *   7  → P1.04   IP5328 INT/RSET 状态输入（高 = 主板醒着）
@@ -80,6 +83,30 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define NTC_ADC_FULL_SCALE_MV 3600U
 #define NTC_ADC_MAX_RAW ((1U << 12) - 1U)
 
+/*
+ * 电池电压采样（模组第 4 脚 = P1.12 = AIN5）。
+ *
+ * ADC 用内部 0.9V 参考 + 1/4 增益 → 满量程 3.6V，超过 3.6V 就削顶。
+ * 锂电池满电 4.2V，所以外面必须分压。默认按 1:1（R1=R2）算，
+ * 4.2V → 2.1V，离 3.6V 满量程还有余量。
+ *
+ *   BAT ──[R1]──┬── 模组第 4 脚
+ *               └──[R2]── GND
+ *
+ * 分压比 = (R1 + R2) / R2。R1=R2 时就是 2。
+ * 换别的阻值只改这两个宏，不要改代码逻辑。
+ */
+#define BAT_ADC_DIVIDER_NUM 2U
+#define BAT_ADC_DIVIDER_DEN 1U
+
+/*
+ * 只认落在这个区间的读数。分压没接时模组第 4 脚是悬空的，
+ * ADC 会读到乱七八糟的值，光看"大于 0"会把悬空当成真电压上报。
+ * 单节锂电正常范围 2.5~4.4V，放宽到 1.5~5.0V。
+ */
+#define BAT_ADC_MIN_VALID_MV 1500U
+#define BAT_ADC_MAX_VALID_MV 5000U
+
 #define BATTERY_FULL_MV 3000U
 #define BATTERY_EMPTY_MV 2200U
 
@@ -133,6 +160,15 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define IP5328_BIT_DELAY_US 2U
 
 #define IP5328_REPORT_LEN 16U
+
+/*
+ * IP5328 报告特征第 0 字节的含义：
+ *   0x00 = I2C 没通，而且模组第 4 脚的分压也没接（整包全 0）
+ *   0x01 = I2C 通了，绑定组合 A
+ *   0xFE = I2C 没通，但 [4..5] 里是模组 ADC 实测的电池电压
+ */
+#define IP5328_REPORT_OK_BASE 0x01U
+#define IP5328_REPORT_ADC_FALLBACK 0xFEU
 
 /*
  * 总线诊断结果，只读。IP5328 读不通时靠它远程判断卡在哪一步：
@@ -207,6 +243,9 @@ struct ntc_capture {
 	uint16_t adc_min_mv;
 	uint16_t adc_max_mv;
 	uint16_t sample_count;
+	/* 模组第 4 脚 (P1.12/AIN5) 分压后测到的电池电压，已换算回 BAT 端 */
+	uint16_t bat_mv;
+	uint16_t bat_raw_mv;
 };
 
 struct soc_point {
@@ -275,6 +314,7 @@ static const struct soc_point soc_table[] = {
 
 static const struct adc_dt_spec ntc_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
 static const struct adc_dt_spec vdd_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 1);
+static const struct adc_dt_spec bat_adc = ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 2);
 static const struct gpio_dt_spec ntc_power = GPIO_DT_SPEC_GET(DT_ALIAS(ntcpower), gpios);
 static const struct device *const ip_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
@@ -308,7 +348,11 @@ BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
 static bool connected;
 static bool vdd_adc_ready;
+static bool bat_adc_ready;
 static int16_t adc_sample_buffer[2];
+
+/* 最近一次 ADC 兜底测到的电池电压（mV），给 IP5328 报告特征兜底用 */
+static uint16_t bat_adc_mv;
 
 /* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
 static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
@@ -1193,7 +1237,18 @@ static int ip5328_sample(struct ip5328_data *d)
 
 static void ip5328_encode_report(const struct ip5328_data *d)
 {
-	ip5328_report[0] = d->valid ? (uint8_t)(1U + d->bind) : 0U;
+	if (!d->valid && bat_adc_mv > 0U) {
+		/*
+		 * I2C 读不通，但模组第 4 脚的电池分压是活的。
+		 * 这一格就改报 ADC 实测的电池电压，方便现场验收（不用看串口日志）。
+		 */
+		memset(ip5328_report, 0, sizeof(ip5328_report));
+		ip5328_report[0] = IP5328_REPORT_ADC_FALLBACK;
+		sys_put_le16(bat_adc_mv, &ip5328_report[4]);
+		return;
+	}
+
+	ip5328_report[0] = d->valid ? (uint8_t)(IP5328_REPORT_OK_BASE + d->bind) : 0U;
 	ip5328_report[1] = (uint8_t)((d->sys_state & 0x07U) | (d->charging ? 0x10U : 0U) |
 				     (d->full ? 0x40U : 0U));
 	ip5328_report[2] = (uint8_t)(d->charge_stage & 0x07U);
@@ -1307,6 +1362,18 @@ static int configure_adc(void)
 	}
 
 	vdd_adc_ready = true;
+
+	/*
+	 * 电池电压那一路是"能用就更好"：模组第 4 脚没接分压时读数会贴着 0，
+	 * 所以这里失败只告警，不影响 NTC 和 I2C。
+	 */
+	bat_adc_ready = false;
+	if (adc_is_ready_dt(&bat_adc) && adc_channel_setup_dt(&bat_adc) == 0) {
+		bat_adc_ready = true;
+	} else {
+		LOG_WRN("Battery ADC (模组 4 脚 / P1.12 / AIN5) 不可用，电池电压只能靠 IP5328");
+	}
+
 	return 0;
 }
 
@@ -1381,10 +1448,13 @@ static int sample_ntc(struct ntc_capture *capture)
 {
 	uint32_t adc_sum = 0;
 	uint32_t vdd_sum = 0;
+	uint32_t bat_sum = 0;
+	uint16_t bat_count = 0;
 	uint16_t adc_min = UINT16_MAX;
 	uint16_t adc_max = 0;
 	int32_t adc_mv;
 	int32_t vdd_mv;
+	int32_t bat_mv;
 	int last_error = -EIO;
 	int ret;
 
@@ -1417,6 +1487,14 @@ static int sample_ntc(struct ntc_capture *capture)
 			vdd_mv = NTC_SUPPLY_FALLBACK_MV;
 		}
 
+		if (bat_adc_ready) {
+			ret = read_adc_mv(&bat_adc, &bat_mv);
+			if (ret == 0) {
+				bat_sum += (uint32_t)CLAMP(bat_mv, 0, UINT16_MAX);
+				bat_count++;
+			}
+		}
+
 		adc_mv = CLAMP(adc_mv, 0, UINT16_MAX);
 		vdd_mv = CLAMP(vdd_mv, 0, UINT16_MAX);
 		adc_sum += (uint32_t)adc_mv;
@@ -1440,6 +1518,22 @@ static int sample_ntc(struct ntc_capture *capture)
 	capture->ntc_ohms = ntc_resistance_ohms(capture->adc_mv, capture->vdd_mv);
 	capture->temp_centi = ntc_ohms_to_centi(capture->ntc_ohms);
 
+	/*
+	 * 分压后的电压换算回 BAT 端：(adc × NUM) / DEN。
+	 * 换算完再判区间 —— 悬空脚读出来的值大概率落不进来，就被当成"没接"。
+	 */
+	if (bat_count > 0U) {
+		uint32_t raw = bat_sum / bat_count;
+		uint32_t bat = (raw * BAT_ADC_DIVIDER_NUM) / BAT_ADC_DIVIDER_DEN;
+
+		capture->bat_raw_mv = (uint16_t)MIN(raw, 0xFFFFU);
+		if (bat >= BAT_ADC_MIN_VALID_MV && bat <= BAT_ADC_MAX_VALID_MV) {
+			capture->bat_mv = (uint16_t)bat;
+		}
+	}
+
+	bat_adc_mv = capture->bat_mv;
+
 	return 0;
 }
 
@@ -1462,7 +1556,15 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	if (ip->valid) {
 		soc = ip->soc;
 		volt_mv = ip->batocv_mv;
+	} else if (ntc->bat_mv > 0U) {
+		/*
+		 * I2C 不通，但模组第 4 脚的分压接上了 —— 用 ADC 实测的电池电压。
+		 * 这是兜底：只有电压，没有电流/功率/充电状态。
+		 */
+		volt_mv = ntc->bat_mv;
+		soc = battery_percent_from_mv(volt_mv);
 	} else {
+		/* 分压也没接，只能拿模组自己的供电电压充数（不是电池电压） */
 		soc = battery_percent_from_mv(ntc->vdd_mv);
 		volt_mv = ntc->vdd_mv;
 	}
@@ -1480,6 +1582,7 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	LOG_INF("temp=%d.%02dC ntc=%uohm adc=%umV vdd=%umV samples=%u", ntc->temp_centi / 100,
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
+	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
