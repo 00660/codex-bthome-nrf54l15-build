@@ -15,7 +15,8 @@ IP5328 那套 I2C 代码全都还在（`src/main.c` 里一点没删），只是�
 - **充电状态**：**主要看模组第 6 脚有没有充电输入**（数字信号，直接可靠）；
   没接这一路时才退到"电池电压往哪边走"的斜率法
 - 只读 GATT：报告（16B）、总线诊断（34B，I2C 关掉时整包 `0xFF`）、版本号字符串
-- BLE 广播 BTHome v2：temperature、battery、voltage、**charging（充电中）**、firmware version
+- BLE 广播 BTHome v2：temperature、battery、voltage（电池）、**charging（充电中，`0x16`）**、
+  **text（充电输入电压，`0x53`，形如 `4.93V`）**、firmware version
 - **双唤醒**：每 10 分钟定时醒一次 + 模组第 8 脚按键随时唤醒
 - 每轮醒来广播 120 秒（OTA 窗口），之后停止广播进入低功耗睡眠
 - **默认常醒测试模式**：不休眠、一直可连接，测完写一个特征切回正常休眠
@@ -294,10 +295,10 @@ KEY ── WLED(照明 LED，阳极在 KEY、阴极在 GND)
 
 设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 20 字节 service data）。
 
-BTHome service data（20 字节）：
+BTHome service data（24 字节）：
 
 ```text
-D2 FC 40 01 BB 02 TT TT 0C VV VV 0E II II 15 CC F2 PP MM JJ
+D2 FC 40 01 BB 02 TT TT 0C VV VV 16 CC 53 05 "4.93V" F2 PP MM JJ
 ```
 
 | 字节 | 内容 |
@@ -307,19 +308,65 @@ D2 FC 40 01 BB 02 TT TT 0C VV VV 0E II II 15 CC F2 PP MM JJ
 | `01 BB` | battery，uint8，单位 %（查放电曲线表，见下） |
 | `02 TT TT` | temperature，sint16，factor 0.01 °C |
 | `0C VV VV` | voltage，uint16，factor 0.001 V（**电池电压**） |
-| `0E II II` | generic voltage，uint16，factor 0.001 V（**充电输入电压**，已把 11:1 分压反算回去） |
-| `15 CC` | **charging**，uint8，`1` = 插着充电器 / `0` = 没插 |
+| `16 CC` | **charging**，uint8，`1` = 插着充电器 / `0` = 没插 |
+| `53 05 ...` | **text**，长度字节 + 5 字节 ASCII（**充电输入电压**，形如 `4.93V`） |
 | `F2 PP MM JJ` | firmware version，patch / minor / major |
 
 ⚠️ **BTHome 要求 object id 按数值从小到大排列**，接收端碰到不认识的 id 会直接停止解析后面的内容。
-所以顺序必须是 `01 < 02 < 0C < 0E < 15 < F2`，改字段时别打乱。
+所以顺序必须是 `01 < 02 < 0C < 16 < 53 < F2`，改字段时别打乱。
 
-**为什么充电电压用 `0x0E` 而不是再来一个 `0x0C`**：同一个广播包里 `0x0C` 只能出现一次
-（接收端按键取值，重复会打架），而 `0x0E`（generic voltage）就是给"另一个电压"准备的，
-精度同样是 0.001V。有些 App 会把它显示成"电压 2"或"通用电压"，也有的不显示 —— 看 App 实现。
+### ★ 这几个 id 的正确含义（别凭印象写）
+
+**这是踩过的坑。** 之前把 id 记错了，结果 HA 里冒出一堆莫名其妙的实体：
+
+| id | 正确含义 | 曾经的错误用法 |
+|---|---|---|
+| `0x0C` | **voltage**（唯一的电压对象，0.001V） | ✅ 一直用对（电池电压） |
+| `0x0E` | **PM10 颗粒物浓度** | ❌ 曾当成"通用电压"塞充电电压，HA 建了个 `PM10 = 4928 μg/m³` |
+| `0x15` | **Battery**（电池状态，布尔） | ❌ 曾当成 charging，HA 里显示成"电池" |
+| `0x16` | **Battery charging**（充电中，布尔） | ✅ 才是真正的 charging |
+| `0x53` | **text**（变长 UTF-8 字符串） | ✅ 现在用来放充电输入电压 |
+
+**关键约束：BTHome 只有一个电压对象 `0x0C`，一个包里只能出现一次。**
+没有"第二个电压"的位置 —— 所以充电输入电压不能再用数值对象，改用 `0x53` 文本对象
+直接广播人眼可读的 `"4.93V"`，HA 会建一个文本实体原样显示。
+
+`0x53` 的格式是 **`53 LL <LL 字节 UTF-8>`**，解析器靠长度字节推进到下一个对象，
+所以**长度必须写对**。我们固定填 5 字节（`"4.93V"`），没插充电器时填 `"0.00V"` ——
+**必须定长**，否则后面 `F2` 的偏移会飘。
 
 **充电输入电压的精度**：1M 和 100k 各有 1% 误差，合起来约 2%，在 5V 上有 ±100mV 不确定度。
-所以它适合"看个大概"，不能当万用表。没插充电器时是 `0`。
+所以它适合"看个大概"，不能当万用表。没插充电器时是 `0.00V`。
+
+### 各字段的值字节偏移
+
+代码里 `BTHOME_*_OFFSET` 的语义统一是**该字段「值」的第一个字节**，不含 object id：
+
+| 下标 | 内容 | 宏 |
+|---|---|---|
+| 0 1 2 | `D2 FC 40` | — |
+| **4** | battery 值（1 字节） | `BTHOME_BATTERY_OFFSET` |
+| **6** | temperature 值（2 字节） | `BTHOME_TEMP_OFFSET` |
+| **9** | 电池 voltage 值（2 字节） | `BTHOME_VOLTAGE_OFFSET` |
+| **12** | charging 值（1 字节） | `BTHOME_CHARGING_OFFSET` |
+| **14** | text 长度字节 | `BTHOME_VBUS_TEXT_LEN_OFFSET` |
+| **15** | text 内容首字符（5 字节） | `BTHOME_VBUS_TEXT_OFFSET` |
+| **21** | firmware version 值（3 字节） | `BTHOME_VERSION_OFFSET` |
+
+数组总长 24 = `BTHOME_VERSION_OFFSET(21) + 3`，文件里有一行 `BUILD_ASSERT` 卡这个等式。
+
+广播包尺寸：`ad = flags(3) + service data(2+24) = 29 字节`（上限 31，余 2 字节）。
+
+**实测样例**（0.32.0，插着充电器）：
+
+```text
+广播字节：40 01 53 02 04 0b 0c 26 10 16 01 53 05 34 2e 39 33 56 f2 00 20 00
+解析    ：battery=83%  temp=28.20C  voltage=4.134V(电池)
+          ★charging=1（插着充电器）  ★充电输入=4.93V  fw=0.32.0
+```
+
+> 注意这里没有开头的 `D2 FC` —— Windows 的 bleak 有时会把 16bit service UUID 剥掉，
+> 只给后面的内容。解析脚本两种开头都要兼容（见 `.pushretry/scan_bthome.py`）。
 
 ### 电量百分比是怎么算的
 
@@ -346,15 +393,27 @@ D2 FC 40 01 BB 02 TT TT 0C VV VV 0E II II 15 CC F2 PP MM JJ
 带载放电时可能是 25%。所以这个百分比是"静置开压估计值"，只有电池静置、
 没有大电流时才比较可信。要精确得靠库仑计。
 
-`0x15` 是 BTHome 标准的 charging 对象，**只能表达布尔量**。取值规则：
-`charge_state` 是 `CHARGING`（正在充）或 `FULL`（插着但已充满）就报 `1`，
+`0x16` 是 BTHome 标准的 charging 对象（`device_class = BATTERY_CHARGING`），**只能表达布尔量**。
+取值规则：`charge_state` 是 `CHARGING`（正在充）或 `FULL`（插着但已充满）就报 `1`，
 其余（`IDLE` 待机 / `DISCHARGING` 放电 / `UNKNOWN` 还没攒够窗口）报 `0`。
 
 想要 `IDLE` / `DISCHARGING` / `FULL` **四态细分**的话，这个标准对象做不到 ——
 得去读 GATT 报告特征值的 `[10:12]`（见下一节）。
 
-电量百分比：有 IP5328 数据时用 BATOCV 查放电曲线表算；没有时用 ADC 实测的电池电压查同一张表；
+电量百分比：`soc_from_mv()` 一个函数算，两条路径共用 —— 有 IP5328 数据时用 BATOCV，
+没有时用 ADC 实测的电池电压，都是查同一张 `soc_table[]`，保证口径一致。
 连电池分压都没接时，才回退到原来的 VDD 电压法。
+
+### 开机首帧不是坏数据
+
+广播启动**之前**先做一次真实 ADC 采样（`main()` 里 `start_advertising()` 前面那段）。
+
+以前是直接开播，payload 用的还是 `set_error_capture()` 留下的默认值 ——
+`bat_mv=0` → `soc=0%`、`charge_state=0` → `charging=0`。结果开机后第一个广播帧
+永远是"电量 0%、没插充电器"，要等静默期加第一轮循环（十几秒）才变真值。
+手机 App 一开机扫到那一帧，就会把设备记成"电量 0%"，看着像坏了一样。
+
+ADC 采样不受 I2C 静默期影响（静默期只管 I2C 两脚），所以提前采没有问题。
 
 ## GATT 报告
 

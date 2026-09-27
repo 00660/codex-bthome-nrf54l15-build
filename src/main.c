@@ -61,29 +61,39 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BTHOME_ID_BATTERY 0x01
 #define BTHOME_ID_TEMPERATURE 0x02
 #define BTHOME_ID_VOLTAGE 0x0C
-#define BTHOME_ID_VBUS_VOLTAGE 0x0E
-#define BTHOME_ID_CHARGING 0x15
+#define BTHOME_ID_CHARGING 0x16
+#define BTHOME_ID_TEXT 0x53
 #define BTHOME_ID_FIRMWARE_VERSION 0xF2
 
 /*
+ * ★ 这一段的 id 是从 bthome-ble 的 MEAS_TYPES 表逐个核对过的，别再凭印象写。
+ *
+ * 踩过的坑（0.31.0 及之前的错误认知）：
+ *   - 以为 0x0E 是 generic voltage → **其实是 PM10（颗粒物浓度）**。
+ *     塞了个 4928 进去，HA 就建了个"PM10 = 4928 μg/m³"的实体，莫名其妙。
+ *   - 以为 0x15 是 charging     → **其实是 Battery（电池状态）**。
+ *     HA 里显示成"电池"二进制传感器，语义也是错的。
+ * 真相：
+ *   - charging 是 **0x16**（device_class = BATTERY_CHARGING）。
+ *   - BTHome **只有一个电压对象 0x0C**，一个包里只能出现一次。
+ *     没有"第二个电压"对象，所以充电输入电压改用 **0x53 文本对象**，
+ *     直接广播人眼可读的 "4.93V" 字符串 —— 这样 HA 建一个文本实体，
+ *     原样显示，不用猜哪个数值对象该对哪个量。
+ *
  * BTHome 要求 object id 按数值从小到大排列，接收端碰到不认识的 id
- * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < 0E < 15 < F2。
+ * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < 16 < 53 < F2。
  *
  * 电流对象（0x5D）已经摘掉 —— 这块板子拿去给别的设备供电，不需要采电流。
  *
- * 0x0C = voltage      —— 电池电压（主电压）
- * 0x0E = generic voltage —— 充电器输入电压（VBUS 反算回来的真实值）
- *
- * 为什么充电输出电压用 0x0E 而不是再来一个 0x0C：
- * BTHome 里同一个广播包里 0x0C 只能出现一次（接收端按键取值，重复会打架），
- * 而 0x0E 就是给"另一个电压"准备的通用电压对象，精度同样是 0.001V。
- * 有些 App 会把 0x0E 显示成"电压 2"或"通用电压"，也有的不显示 —— 看 App 实现。
- *
- * 0x15 = charging（布尔）。这是 BTHome 标准的"充电中"对象，
- * 值 1 = 充电中 / 0 = 没充电。下面用它表达"插着充电器"：
- * charge_state 是 CHARGING 或 FULL 就报 1，其余报 0。
+ * 0x16 = charging（布尔）。值 1 = 充电中 / 0 = 没充电。下面用它表达
+ * "插着充电器"：charge_state 是 CHARGING 或 FULL 就报 1，其余报 0。
  * 想要 IDLE / DISCHARGING / FULL 四态细分的话，这个标准对象做不到，
  * 得去读 GATT 报告特征值（6f6b0201-…）的 [10:12]。
+ *
+ * 0x53 = text（变长 UTF-8）。格式是 **id + 长度字节 + 数据**：
+ *   53 LL xx xx ...   （LL = 后面字符串的字节数）
+ * 解析器靠这个长度字节推进到下一个对象，所以**长度必须写对**。
+ * 我们固定填 5 字节（"4.93V"），所以 VERSION_OFFSET 是定死的。
  */
 /*
  * 各字段的字节偏移。语义统一：**指向该字段的「值」的第一个字节**，
@@ -93,19 +103,26 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  *   0  1  2      : D2 FC 40          BTHome UUID + v2 标识
  *   3  4         : 01 BB             battery
  *   5  6  7      : 02 TT TT          temperature
- *   8  9  10     : 0C VV VV          voltage（电池）
- *   11 12 13     : 0E II II          generic voltage（充电输入）
- *   14 15        : 15 CC             charging
- *   16 17 18 19  : F2 PP MM JJ       firmware version
+ *   8  9  10     : 0C VV VV          voltage（电池，0.001V）
+ *   11 12        : 16 CC             charging
+ *   13 14        : 53 LL             text 头（id + 长度字节，值从 15 开始）
+ *   15 16 17 18 19: "4.93V"          text 内容（固定 5 字节）
+ *   20 21 22 23  : F2 PP MM JJ       firmware version
  *
- * 所以 VERSION_OFFSET = 17（PP 的下标），数组总长 = 17 + 3 = 20。
+ * 所以 VERSION_OFFSET = 21（PP 的下标），数组总长 = 21 + 3 = 24。
+ *
+ * 注意 VBUS_TEXT_OFFSET 指向的是**字符串的第一个字符**（下标 15），
+ * 不是 0x53 也不是长度字节 —— 字符串是定长的，长度字节单独占下标 14，
+ * 由 VBUS_TEXT_LEN_OFFSET 指。
  */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
 #define BTHOME_VOLTAGE_OFFSET 9U
-#define BTHOME_VBUS_VOLTAGE_OFFSET 12U
-#define BTHOME_CHARGING_OFFSET 15U
-#define BTHOME_VERSION_OFFSET 17U
+#define BTHOME_CHARGING_OFFSET 12U
+#define BTHOME_VBUS_TEXT_LEN_OFFSET 14U
+#define BTHOME_VBUS_TEXT_OFFSET 15U
+#define BTHOME_VBUS_TEXT_LEN 5U
+#define BTHOME_VERSION_OFFSET 21U
 
 /* ---------------- NTC ---------------- */
 
@@ -533,15 +550,19 @@ static uint32_t diag_key_count;
 static bool diag_from_key;
 
 /*
- * BTHome service data，20 字节：
+ * BTHome service data，24 字节：
  *   D2 FC         BTHome UUID，小端
  *   40            BTHome v2，未加密
  *   01 BB         battery，uint8，%
  *   02 TT TT      temperature，sint16，0.01 °C
  *   0C VV VV      voltage，uint16，0.001 V（电池电压）
- *   0E II II      generic voltage，uint16，0.001 V（充电输入电压，反算过）
- *   15 CC         charging，uint8，1 = 插着充电器 / 0 = 没插
+ *   16 CC         charging，uint8，1 = 插着充电器 / 0 = 没插
+ *   53 05 "4.93V" text，长度字节 + 5 字节 ASCII（充电输入电压，人眼可读）
  *   F2 PP MM JJ   firmware version，patch/minor/major
+ *
+ * 文本里固定填 5 个字符（形如 "4.93V"），没插充电器时填 "0.00V" ——
+ * **必须定长**，因为 0x53 的长度字节会决定后面 F2 的偏移，
+ * 长度一变 VERSION_OFFSET 就飘了（而且广播长度也不能超 31 字节）。
  */
 static uint8_t bthome_service_data[] = {
 	BTHOME_UUID_LE_0,
@@ -555,11 +576,11 @@ static uint8_t bthome_service_data[] = {
 	BTHOME_ID_VOLTAGE,
 	0x00,
 	0x00,
-	BTHOME_ID_VBUS_VOLTAGE,
-	0x00,
-	0x00,
 	BTHOME_ID_CHARGING,
 	0x00,
+	BTHOME_ID_TEXT,
+	BTHOME_VBUS_TEXT_LEN,
+	'0', '.', '0', '0', 'V',
 	BTHOME_ID_FIRMWARE_VERSION,
 	APP_PATCHLEVEL,
 	APP_VERSION_MINOR,
@@ -568,7 +589,7 @@ static uint8_t bthome_service_data[] = {
 
 /*
  * 数组总长 = 版本号第一个值字节的下标 + 3（PP / MM / JJ 三个字节）。
- * 这个 assert 是防呆的：加字段时漏一个占位 0x00 就会在这里编译失败，
+ * 这个 assert 是防呆的：加字段时漏一个占位就会在这里编译失败，
  * 而不是等到设备上广播解析不出来才发现。
  */
 BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
@@ -577,10 +598,10 @@ BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
 static uint8_t ip5328_report[IP5328_REPORT_LEN];
 
 /*
- * 广播包只有 31 字节，BTHome service data 20 字节，再塞完整设备名就超了。
+ * 广播包只有 31 字节，BTHome service data 24 字节，再塞完整设备名就超了。
  * 所以设备名挪到 scan response 里，两边都放得下：
- *   ad = flags(3) + service data(2+20) = 25 字节
- *   sd = name(9) + 128bit UUID(18)     = 27 字节
+ *   ad = flags(3) + service data(2+24) = 29 字节  (上限 31)
+ *   sd = name(9) + 128bit UUID(18)     = 27 字节  (上限 31)
  */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
@@ -1903,7 +1924,7 @@ static int sample_ntc(struct ntc_capture *capture)
 			capture->vbus_mv = avg;
 			/*
 			 * 确认插着充电器了，才反算回输入端的真实电压给广播用。
-			 * 没插时留在 0，广播里 0x0E 就是 0（App 显示 0V，一看就知道没插）。
+			 * 没插时留在 0，广播里 0x53 文本就是 "0.00V"（一眼就知道没插）。
 			 */
 			uint32_t vin = (uint32_t)avg * VBUS_DIVIDER_NUM / VBUS_DIVIDER_DEN;
 
@@ -1953,12 +1974,38 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	put_s16_le(&bthome_service_data[BTHOME_TEMP_OFFSET], ntc->temp_centi);
 	sys_put_le16(volt_mv, &bthome_service_data[BTHOME_VOLTAGE_OFFSET]);
 	/*
-	 * 0x0E generic voltage：充电器输入电压（已经把 11:1 分压反算回去了）。
-	 * 没插充电器时是 0，App 上显示 0V，一眼就知道没插。
+	 * 0x53 text：充电器输入电压，格式化成 "4.93V" 这种 5 字符。
+	 *
+	 * 为什么用文本而不是数值对象：BTHome 只有一个电压对象 0x0C（已经给电池了），
+	 * 没有"第二个电压"，硬塞别的数值对象只会让 HA 显示成 PM10 那种莫名其妙的实体。
+	 * 文本对象 0x53 的格式是 【id】【长度字节】【UTF-8 数据】，HA 会建一个文本实体
+	 * 原样显示，正好适合"人眼读一个带单位的数"。
+	 *
+	 * 长度必须恒为 5：长度字节决定后面 F2 的位置，一变 VERSION_OFFSET 就飘。
+	 * 所以没插充电器时也照样写 "0.00V"，不留空串。
+	 * vbus_in_mv 上限按 5 位数字算（99999mV = 99.999V），超过就削顶到 "99.9V"，
+	 * 反正是异常情况，不至于让字符串变长把广播写坏。
 	 */
-	sys_put_le16(ntc->vbus_in_mv, &bthome_service_data[BTHOME_VBUS_VOLTAGE_OFFSET]);
+	{
+		uint32_t text_mv = ntc->vbus_in_mv;
+		uint8_t *p = &bthome_service_data[BTHOME_VBUS_TEXT_OFFSET];
+
+		/* 只显示 0~9.99V 这一档，超了就削顶（正常 USB 5V / 9V 都在量程内） */
+		if (text_mv > 9999U) {
+			text_mv = 9999U;
+		}
+
+		/* 拼成 "4.93V" 这种 5 字符：整数位 + '.' + 十分位 + 百分位 + 'V' */
+		p[0] = (uint8_t)('0' + (text_mv / 1000U) % 10U);
+		p[1] = '.';
+		p[2] = (uint8_t)('0' + (text_mv / 100U) % 10U);
+		p[3] = (uint8_t)('0' + (text_mv / 10U) % 10U);
+		p[4] = 'V';
+	}
+	/* 长度字节：固定 5，见上面注释 */
+	bthome_service_data[BTHOME_VBUS_TEXT_LEN_OFFSET] = BTHOME_VBUS_TEXT_LEN;
 	/*
-	 * 0x15 charging：这是布尔量，只能表达"有没有在充电"。
+	 * 0x16 charging：这是布尔量，只能表达"有没有在充电"。
 	 * CHARGING（正在充）和 FULL（插着但已充满）都算"插着充电器"报 1，
 	 * 其余（IDLE 待机 / DISCHARGING 放电 / UNKNOWN 没攒够窗口）报 0。
 	 */
@@ -1976,8 +2023,13 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
-	LOG_INF("vbus=%umV -> vin=%umV charge_state=%u", ntc->vbus_mv, ntc->vbus_in_mv,
-		ntc->charge_state);
+	LOG_INF("vbus=%umV -> vin=%umV charge_state=%u text=\"%c%c%c%c%c\"", ntc->vbus_mv,
+		ntc->vbus_in_mv, ntc->charge_state,
+		bthome_service_data[BTHOME_VBUS_TEXT_OFFSET],
+		bthome_service_data[BTHOME_VBUS_TEXT_OFFSET + 1U],
+		bthome_service_data[BTHOME_VBUS_TEXT_OFFSET + 2U],
+		bthome_service_data[BTHOME_VBUS_TEXT_OFFSET + 3U],
+		bthome_service_data[BTHOME_VBUS_TEXT_OFFSET + 4U]);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
