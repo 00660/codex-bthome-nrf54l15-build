@@ -15,8 +15,8 @@ IP5328 那套 I2C 代码全都还在（`src/main.c` 里一点没删），只是�
 - **充电状态**：**主要看模组第 6 脚有没有充电输入**（数字信号，直接可靠）；
   没接这一路时才退到"电池电压往哪边走"的斜率法
 - 只读 GATT：报告（16B）、总线诊断（34B，I2C 关掉时整包 `0xFF`）、版本号字符串
-- BLE 广播 BTHome v2：temperature、battery、voltage（电池）、**charging（充电中，`0x16`）**、
-  **text（充电输入电压，`0x53`，形如 `4.93V`）**、firmware version
+- BLE 广播 BTHome v2：temperature、battery、voltage（电池，`0x0C`）、**charging（充电中，`0x16`）**、
+  **voltage（充电输入电压，`0x4A`，0.1V 一档）**、firmware version（`0xF2`）
 - **双唤醒**：每 10 分钟定时醒一次 + 模组第 8 脚按键随时唤醒
 - 每轮醒来广播 120 秒（OTA 窗口），之后停止广播进入低功耗睡眠
 - **默认常醒测试模式**：不休眠、一直可连接，测完写一个特征切回正常休眠
@@ -295,10 +295,10 @@ KEY ── WLED(照明 LED，阳极在 KEY、阴极在 GND)
 
 设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 20 字节 service data）。
 
-BTHome service data（24 字节）：
+BTHome service data（20 字节）：
 
 ```text
-D2 FC 40 01 BB 02 TT TT 0C VV VV 16 CC 53 05 "4.93V" F2 PP MM JJ
+D2 FC 40 01 BB 02 TT TT 0C VV VV 16 CC 4A II II F2 PP MM JJ
 ```
 
 | 字节 | 内容 |
@@ -307,13 +307,13 @@ D2 FC 40 01 BB 02 TT TT 0C VV VV 16 CC 53 05 "4.93V" F2 PP MM JJ
 | `40` | BTHome v2，未加密 |
 | `01 BB` | battery，uint8，单位 %（查放电曲线表，见下） |
 | `02 TT TT` | temperature，sint16，factor 0.01 °C |
-| `0C VV VV` | voltage，uint16，factor 0.001 V（**电池电压**） |
+| `0C VV VV` | voltage，uint16，factor **0.001 V**（**电池电压**） |
 | `16 CC` | **charging**，uint8，`1` = 插着充电器 / `0` = 没插 |
-| `53 05 ...` | **text**，长度字节 + 5 字节 ASCII（**充电输入电压**，形如 `4.93V`） |
+| `4A II II` | voltage，uint16，factor **0.1 V**（**充电输入电压**） |
 | `F2 PP MM JJ` | firmware version，patch / minor / major |
 
 ⚠️ **BTHome 要求 object id 按数值从小到大排列**，接收端碰到不认识的 id 会直接停止解析后面的内容。
-所以顺序必须是 `01 < 02 < 0C < 16 < 53 < F2`，改字段时别打乱。
+所以顺序必须是 `01 < 02 < 0C < 16 < 4A < F2`，改字段时别打乱。
 
 ### ★ 这几个 id 的正确含义（别凭印象写）
 
@@ -321,22 +321,25 @@ D2 FC 40 01 BB 02 TT TT 0C VV VV 16 CC 53 05 "4.93V" F2 PP MM JJ
 
 | id | 正确含义 | 曾经的错误用法 |
 |---|---|---|
-| `0x0C` | **voltage**（唯一的电压对象，0.001V） | ✅ 一直用对（电池电压） |
-| `0x0E` | **PM10 颗粒物浓度** | ❌ 曾当成"通用电压"塞充电电压，HA 建了个 `PM10 = 4928 μg/m³` |
-| `0x15` | **Battery**（电池状态，布尔） | ❌ 曾当成 charging，HA 里显示成"电池" |
+| `0x0C` | **voltage**，factor 0.001V | ✅ 一直用对（电池电压） |
+| `0x0E` | **PM10 颗粒物浓度** | ❌ 曾当成通用电压塞充电电压，HA 建了个 `PM10 = 4928 μg/m³` |
+| `0x15` | **Battery**（电池状态，布尔） | ❌ 曾当成 charging，HA 里显示成电池 |
 | `0x16` | **Battery charging**（充电中，布尔） | ✅ 才是真正的 charging |
-| `0x53` | **text**（变长 UTF-8 字符串） | ✅ 现在用来放充电输入电压 |
+| `0x4A` | **voltage**，factor **0.1V** | ✅ 现在用来放充电输入电压 |
+| `0x53` | text（变长 UTF-8） | ❌ 曾用来放 `"4.93V"`，但实体名叫"文本"、没单位、不能画曲线 |
 
-**关键约束：BTHome 只有一个电压对象 `0x0C`，一个包里只能出现一次。**
-没有"第二个电压"的位置 —— 所以充电输入电压不能再用数值对象，改用 `0x53` 文本对象
-直接广播人眼可读的 `"4.93V"`，HA 会建一个文本实体原样显示。
+**BTHome 里能当电压用的 id 只有两个：`0x0C`（0.001V）和 `0x4A`（0.1V）。**
+两个都是标准 `device_class = voltage`，HA 会自动建成带 V 单位的电压实体 ——
+名字、图标、历史曲线都正常。所以电池用 `0x0C`、充电输入用 `0x4A`。
 
-`0x53` 的格式是 **`53 LL <LL 字节 UTF-8>`**，解析器靠长度字节推进到下一个对象，
-所以**长度必须写对**。我们固定填 5 字节（`"4.93V"`），没插充电器时填 `"0.00V"` ——
-**必须定长**，否则后面 `F2` 的偏移会飘。
+⚠️ **`0x4A` 的 factor 是 0.1V 不是 0.001V！填进去的是十分之一伏的整数：**
+`4.93V → 填 49`。填 mV 会显示成 493.0V，差 1000 倍。
+
+**`0xF2` 不建实体，但不是白放的**：解析器会拿它调 `set_device_sw_version()`，
+在 HA 的**设备详情页**固件版本那一栏能看到。
 
 **充电输入电压的精度**：1M 和 100k 各有 1% 误差，合起来约 2%，在 5V 上有 ±100mV 不确定度。
-所以它适合"看个大概"，不能当万用表。没插充电器时是 `0.00V`。
+`0x4A` 的 0.1V 分辨率完全够用。没插充电器时是 `0`。
 
 ### 各字段的值字节偏移
 
@@ -349,20 +352,20 @@ D2 FC 40 01 BB 02 TT TT 0C VV VV 16 CC 53 05 "4.93V" F2 PP MM JJ
 | **6** | temperature 值（2 字节） | `BTHOME_TEMP_OFFSET` |
 | **9** | 电池 voltage 值（2 字节） | `BTHOME_VOLTAGE_OFFSET` |
 | **12** | charging 值（1 字节） | `BTHOME_CHARGING_OFFSET` |
-| **14** | text 长度字节 | `BTHOME_VBUS_TEXT_LEN_OFFSET` |
-| **15** | text 内容首字符（5 字节） | `BTHOME_VBUS_TEXT_OFFSET` |
-| **21** | firmware version 值（3 字节） | `BTHOME_VERSION_OFFSET` |
+| **14** | 充电输入 voltage 值（2 字节） | `BTHOME_VBUS_VOLTAGE_OFFSET` |
+| **17** | firmware version 值（3 字节） | `BTHOME_VERSION_OFFSET` |
 
-数组总长 24 = `BTHOME_VERSION_OFFSET(21) + 3`，文件里有一行 `BUILD_ASSERT` 卡这个等式。
+数组总长 20 = `BTHOME_VERSION_OFFSET(17) + 3`，文件里有两行 `BUILD_ASSERT` 卡这个等式
+和广播包大小上限。
 
-广播包尺寸：`ad = flags(3) + service data(2+24) = 29 字节`（上限 31，余 2 字节）。
+广播包尺寸：`ad = flags(3) + service data(2+20) = 25 字节`（上限 31，余 6 字节）。
 
-**实测样例**（0.32.0，插着充电器）：
+**实测样例**（0.33.0，插着充电器）：
 
 ```text
-广播字节：40 01 53 02 04 0b 0c 26 10 16 01 53 05 34 2e 39 33 56 f2 00 20 00
-解析    ：battery=83%  temp=28.20C  voltage=4.134V(电池)
-          ★charging=1（插着充电器）  ★充电输入=4.93V  fw=0.32.0
+广播字节：40 01 53 02 aa 0a 0c 18 10 16 01 4a 31 00 f2 00 21 00
+解析    ：battery=83%  temp=27.30C  voltage=4.120V(电池)
+          ★charging=1（插着充电器）  ★充电输入电压=4.9V  fw=0.33.0
 ```
 
 > 注意这里没有开头的 `D2 FC` —— Windows 的 bleak 有时会把 16bit service UUID 剥掉，
