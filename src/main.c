@@ -2332,6 +2332,26 @@ int main(void)
 	}
 
 	/*
+	 * ★ 开播之前先采一次真实的 ADC。
+	 *
+	 * 之前这里是直接 start_advertising()，广播 payload 用的是 set_error_capture()
+	 * 留下的默认值：bat_mv=0 → soc=0%、charge_state=0 → charging=0。
+	 * 结果开机后第一个广播帧永远是"电量 0%、没插充电器"，要等下一轮采样
+	 * （静默期 + 第一轮循环，十几秒）才变成真值。手机 App 一开机扫到那一帧，
+	 * 就会把设备记成"电量 0%"，看着像坏了一样。
+	 *
+	 * ADC 采样不受下面 I2C 静默期影响（静默期只管 I2C 两脚），所以放心提前采。
+	 */
+	if (sensor_ready) {
+		ret = sample_ntc(&capture);
+		if (ret) {
+			LOG_WRN("开机首次采样失败: %d", ret);
+			set_error_capture(&capture, ret);
+		}
+	}
+	publish_sensors(&capture, &ip);
+
+	/*
 	 * 开机后先安静一会儿：这期间照常广播（可以连上来刷机、读特征），
 	 * 但一个字节都不碰 I2C 两脚。
 	 *
