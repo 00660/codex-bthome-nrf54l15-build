@@ -60,9 +60,9 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BTHOME_DEVICE_INFO_V2 0x40
 #define BTHOME_ID_BATTERY 0x01
 #define BTHOME_ID_TEMPERATURE 0x02
-#define BTHOME_ID_VOLTAGE 0x0C
+#define BTHOME_ID_VBUS_VOLTAGE 0x0C
 #define BTHOME_ID_CHARGING 0x16
-#define BTHOME_ID_VBUS_VOLTAGE 0x4A
+#define BTHOME_ID_VOLTAGE 0x4A
 #define BTHOME_ID_FIRMWARE_VERSION 0xF2
 
 /*
@@ -77,14 +77,19 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  *     塞了个 4928 进去，HA 就建了个"PM10 = 4928 μg/m³"的实体，莫名其妙。
  *   - 以为 0x15 是 charging     → **其实是 Battery（电池状态）**。
  *     HA 里显示成"电池"二进制传感器，语义也是错的。
+ *   - 以为 BTHome 只有 0x0C 一个电压对象 → **其实有两个**：0x0C 和 0x4A。
+ *     （查表时找到一个就收手了，这是偷懒。要把所有含 VOLTAGE 的条目都列出来。）
  *
- * 真相 —— **整个 BTHome 只有两个电压对象**（其余 id 都不是电压）：
- *   0x0C  voltage  factor 0.001V  ← 电池电压用这个
- *   0x4A  voltage  factor 0.1V    ← 充电输入电压用这个（同样的 device_class=voltage，
- *                                    HA 会自动建成一个带 V 单位的电压实体，
- *                                    名字、图标、历史曲线都正常）
- * 0x4A 精度是 0.1V（不是 0.001V），但反算值本身只有 ±100mV 准确度
- * （1M/100k 各 1% 误差），0.1V 一档完全够。
+ * 真相 —— **整个 BTHome 只有这两个电压对象**，都是 device_class = voltage：
+ *   0x0C  voltage  factor 0.001V  ← 精度高（能到 1mV），量程 0~65.535V
+ *   0x4A  voltage  factor 0.1V    ← 精度低（只到 100mV），量程 0~6553.5V
+ *
+ * ★ 分辨率怎么分（2026-09-27 换过位，别按老版本记忆）：
+ *   0x0C 给**充电输入电压** —— 需要看清楚是 4.93V 还是 5.01V，要 1mV 精度。
+ *   0x4A 给**电池电压**   —— 看趋势就够，0.1V 一档完全能接受。
+ *
+ * ⚠️ 注意 id 顺序导致的位置：0x0C(12) < 0x16(22) < 0x4A(74)，
+ *    所以**电池电压在充电电压后面**，offset 也是反的。见下面的下标对照表。
  *
  * charging 是 **0x16**（device_class = BATTERY_CHARGING）。
  *
@@ -101,34 +106,38 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 0xF2 = firmware version（3 字节，小端 patch/minor/major）。
  * 它**不会建实体**，但解析器会拿它调 set_device_sw_version()，
  * 所以在 HA 的设备详情页"固件版本"那一栏能看到 —— 不是白放的。
+ *
+ * ★ 两个 voltage 实体在 HA 里都会叫"电压"（重名会自动加 _2 后缀），
+ *   因为 **BTHome 协议没有给实体指定名字的字段**，名字是接收端按
+ *   device_class 拼的，固件侧改不了。要区分只能在 HA 里手动改名。
  */
 /*
  * 各字段的字节偏移。语义统一：**指向该字段的「值」的第一个字节**，
  * 不包括前面那个 object id 字节。
  *
- * 对照（下标从 0 开始）：
+ * 对照（下标从 0 开始）—— 注意电池电压在充电电压**后面**：
  *   0  1  2      : D2 FC 40          BTHome UUID + v2 标识
  *   3  4         : 01 BB             battery
  *   5  6  7      : 02 TT TT          temperature
- *   8  9  10     : 0C VV VV          voltage（电池，0.001V）
+ *   8  9  10     : 0C II II          voltage（充电输入，0.001V，高精度）
  *   11 12        : 16 CC             charging
- *   13 14 15     : 4A II II          voltage（充电输入，0.1V）
+ *   13 14 15     : 4A BB BB          voltage（电池，0.1V）
  *   16 17 18 19  : F2 PP MM JJ       firmware version
  *
  * 所以 VERSION_OFFSET = 17（PP 的下标），数组总长 = 17 + 3 = 20。
  */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
-#define BTHOME_VOLTAGE_OFFSET 9U
+#define BTHOME_VBUS_VOLTAGE_OFFSET 9U
 #define BTHOME_CHARGING_OFFSET 12U
-#define BTHOME_VBUS_VOLTAGE_OFFSET 14U
+#define BTHOME_VOLTAGE_OFFSET 14U
 #define BTHOME_VERSION_OFFSET 17U
 
 /*
  * 0x4A 的 factor 是 0.1V，所以填进去的是**十分之一伏**的整数。
- * 例：4.93V → 填 49。下面换算时用它，别直接填 mV。
+ * 例：4.1V → 填 41。**千万别拿它直接填 mV**，会显示成 410.0V，差 10 倍。
  */
-#define VBUS_VOLTAGE_DECIVOLTS_DIV 100U
+#define BATTERY_VOLTAGE_DECIVOLTS_DIV 100U
 
 /* ---------------- NTC ---------------- */
 
@@ -185,8 +194,28 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  */
 #define BAT_TREND_WINDOW_MS (5U * 60U * 1000U)
 #define BAT_TREND_MIN_MV 5
-/* 电压已经到这个水平又不再涨，就当充满了（静置的锂电 4.1V 以上基本就是满） */
-#define BAT_FULL_MV 4100U
+
+/*
+ * ★★ 满电电压 —— 这里之前写错，导致"4.1V 就报已充满"。
+ *
+ * 老版本写的是 4100mV，注释还说"静置的锂电 4.1V 以上基本就是满" —— 这是
+ * **普通 4.2V 锂电的旧经验，对高压电芯完全不对**。
+ *
+ * 实测这块板子用的是**高压电芯**：
+ *   万用表量 4.10V，固件读 4118mV（差 0.4%，说明 ADC 换算没问题），
+ *   电芯规格满电 4.35~4.4V。
+ *   4.1V 对高压电芯大概只到 75~80%，根本不该说"已充满"。
+ *
+ * 所以阈值抬到 4300mV —— 高压电芯真正充到顶的水平。
+ * 如果是普通 4.2V 电芯，把这里改成 4150 即可（改一行）。
+ */
+#define BAT_FULL_MV 4300U
+
+/*
+ * 判满还要求"电压不再涨"（见 bat_update_charge_state 里的 !moving）。
+ * 因为恒流充到 4.3V 时电压还在爬，只有进恒压阶段、电流掉下来，
+ * 电压才会真正钉住不动 —— 那才是真满。
+ */
 
 #define BAT_STATE_UNKNOWN 0U     /* 还没攒够一个比较窗口 */
 #define BAT_STATE_IDLE 1U        /* 待机 */
@@ -561,10 +590,13 @@ static bool diag_from_key;
  *   40            BTHome v2，未加密
  *   01 BB         battery，uint8，%
  *   02 TT TT      temperature，sint16，0.01 °C
- *   0C VV VV      voltage，uint16，0.001 V（电池电压）
+ *   0C II II      voltage，uint16，0.001 V（充电输入电压，高精度）
  *   16 CC         charging，uint8，1 = 插着充电器 / 0 = 没插
- *   4A II II      voltage，uint16，0.1 V（充电输入电压，反算过）
+ *   4A BB BB      voltage，uint16，0.1 V（电池电压）
  *   F2 PP MM JJ   firmware version，patch/minor/major
+ *
+ * 注意 0x0C 在 0x4A 前面（id 必须升序），所以**充电电压的下标比电池电压小**，
+ * 跟人的直觉相反，改的时候别按"先电池后充电"的顺序去数。
  */
 static uint8_t bthome_service_data[] = {
 	BTHOME_UUID_LE_0,
@@ -575,12 +607,12 @@ static uint8_t bthome_service_data[] = {
 	BTHOME_ID_TEMPERATURE,
 	0x00,
 	0x00,
-	BTHOME_ID_VOLTAGE,
+	BTHOME_ID_VBUS_VOLTAGE,
 	0x00,
 	0x00,
 	BTHOME_ID_CHARGING,
 	0x00,
-	BTHOME_ID_VBUS_VOLTAGE,
+	BTHOME_ID_VOLTAGE,
 	0x00,
 	0x00,
 	BTHOME_ID_FIRMWARE_VERSION,
@@ -1754,13 +1786,21 @@ static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 	 * VBUS 一变化就立刻出结论，不等窗口。
 	 * 插上/拔掉充电器是个瞬时事件，让人等 5 分钟才看到状态变化没道理。
 	 * 同时把趋势窗口重置 —— 插拔瞬间电压会跳，那段数据不能进斜率比较。
+	 *
+	 * ★ 但"插上就判 FULL"这个逻辑删掉了。
+	 * 之前是 `mv >= BAT_FULL_MV ? FULL : CHARGING` —— 只要插上时电压过了阈值
+	 * 就立刻报"已充满"，这正是"一插上就说满"的元凶之一。
+	 * 电压高不代表充满（充电器把电压顶上去也会高），必须等它稳住不动才算。
+	 * 插上后一律先报 CHARGING，让后面的窗口逻辑去判满。
 	 */
 	if ((int8_t)vbus_present != bat_last_vbus) {
 		bat_last_vbus = (int8_t)vbus_present;
 
 		if (vbus_present) {
-			bat_charge_state = (mv >= BAT_FULL_MV) ? BAT_STATE_FULL : BAT_STATE_CHARGING;
+			/* 插上充电器：先当"充电中"。真满了由窗口逻辑（电压不再涨）判定 */
+			bat_charge_state = BAT_STATE_CHARGING;
 		} else {
+			/* 拔掉：电压到顶且静置才算满，否则就是待机 */
 			bat_charge_state = (mv >= BAT_FULL_MV) ? BAT_STATE_FULL : BAT_STATE_IDLE;
 		}
 
@@ -1981,16 +2021,14 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 
 	bthome_service_data[BTHOME_BATTERY_OFFSET] = soc;
 	put_s16_le(&bthome_service_data[BTHOME_TEMP_OFFSET], ntc->temp_centi);
-	sys_put_le16(volt_mv, &bthome_service_data[BTHOME_VOLTAGE_OFFSET]);
 	/*
-	 * 0x4A voltage：充电器输入电压（已经把 11:1 分压反算回去了）。
+	 * 0x0C voltage：充电器输入电压（已经把 11:1 分压反算回去了）。
 	 *
-	 * ★ 0x4A 的 factor 是 0.1V，不是 0.001V！所以这里填的是**十分之一伏**的整数：
-	 *   4.93V → 49。填 mV 会显示成 493.0V，差 1000 倍。
-	 * 没插充电器时 vbus_in_mv 是 0，填 0，HA 上显示 0.0V，一眼就知道没插。
+	 * ★ 0x0C 的 factor 是 0.001V，所以填的是 **mV**（和电池电压以前一样）。
+	 * 给 0x0C 是为了精度 —— 要看清是 4.93V 还是 5.01V，0.1V 一档不够。
+	 * 没插充电器时 vbus_in_mv 是 0，填 0，HA 上显示 0.000V，一眼就知道没插。
 	 */
-	sys_put_le16((uint16_t)(ntc->vbus_in_mv / VBUS_VOLTAGE_DECIVOLTS_DIV),
-		     &bthome_service_data[BTHOME_VBUS_VOLTAGE_OFFSET]);
+	sys_put_le16(ntc->vbus_in_mv, &bthome_service_data[BTHOME_VBUS_VOLTAGE_OFFSET]);
 	/*
 	 * 0x16 charging：这是布尔量，只能表达"有没有在充电"。
 	 * CHARGING（正在充）和 FULL（插着但已充满）都算"插着充电器"报 1，
@@ -2000,6 +2038,14 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		(ntc->charge_state == BAT_STATE_CHARGING || ntc->charge_state == BAT_STATE_FULL)
 			? 1U
 			: 0U;
+	/*
+	 * 0x4A voltage：电池电压。
+	 * ★ factor 是 0.1V，填的是**十分之一伏**：4120mV → 41（HA 显示 4.1V）。
+	 * 给 0x4A 是因为电池电压只看趋势，0.1V 分辨率够，把高精度的 0x0C
+	 * 让给充电电压。填 mV 会显示成 412.0V，差十倍。
+	 */
+	sys_put_le16((uint16_t)(volt_mv / BATTERY_VOLTAGE_DECIVOLTS_DIV),
+		     &bthome_service_data[BTHOME_VOLTAGE_OFFSET]);
 	bthome_service_data[BTHOME_VERSION_OFFSET] = APP_PATCHLEVEL;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 1U] = APP_VERSION_MINOR;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 2U] = APP_VERSION_MAJOR;
@@ -2010,8 +2056,10 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
-	LOG_INF("vbus=%umV -> vin=%umV(广播里填 %u，0.1V 一档) charge_state=%u", ntc->vbus_mv,
-		ntc->vbus_in_mv, ntc->vbus_in_mv / VBUS_VOLTAGE_DECIVOLTS_DIV, ntc->charge_state);
+	LOG_INF("vbus=%umV -> 0x0C 填 %umV(0.001V档)  charge_state=%u  "
+		"0x4A 填 %u(0.1V档,=%umV)",
+		ntc->vbus_mv, ntc->vbus_in_mv, ntc->charge_state,
+		ntc->bat_mv / BATTERY_VOLTAGE_DECIVOLTS_DIV, ntc->bat_mv);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
