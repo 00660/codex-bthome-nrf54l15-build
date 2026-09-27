@@ -25,6 +25,9 @@
  *   唤醒源 2：模组第 8 脚 KEY 网络下降沿，按下按键立刻醒一轮
  *   每轮流程：采样 → 可连接广播 120 秒（OTA 窗口）→ 停止广播 → 回去睡
  *   广播期间若被连上，一直等到断开才停止广播，所以 OTA 不会被睡眠打断
+ *   ★ 两种"不休眠"：插着充电器（拔掉立刻回睡眠）、温度突变爬升
+ *     （直到温度突变跌落才回睡眠）
+ *   ★ 睡着期间每 2 秒查一次充电器、每 30 秒采一次温度，命中立刻醒
  *   ★ 充电中不休眠：插着充电器时不睡，一直可连接、数据每 5 秒刷一次
  *   上电后第一轮也走同样流程，保证刷完固件还能连上验证或重刷
  */
@@ -297,8 +300,25 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 两者谁先来就用谁，醒来后都是同一套流程：采样 → 开 OTA 窗口 → 回去睡。
  */
 #define SAMPLE_INTERVAL K_MINUTES(10)
+#define SAMPLE_INTERVAL_MS (10 * 60 * 1000)
 #define OTA_WINDOW_SECONDS 120U
 #define KEY_DEBOUNCE_MS 30
+
+/*
+ * 休眠期间的轮询（拔掉充电器后才用得上）：
+ *   每 SLEEP_POLL_MS 只读一次充电器 VBUS —— 插上就立刻醒，不等 10 分钟。
+ *   每 SLEEP_TEMP_TICKS 次轮询（2s × 15 = 30s）采一次完整数据判温度突变。
+ * 单通道 ADC 读一次不到 1ms，平均功耗远低于常醒广播，可以放心轮。
+ */
+#define SLEEP_POLL_MS K_SECONDS(2)
+#define SLEEP_TEMP_TICKS 15U
+
+/*
+ * 温度突变阈值（0.01°C）：一次采样比上次涨 2.00°C 以上 → 立刻转常醒；
+ * 一次采样比上次跌 2.00°C 以上 → 立刻回去睡。
+ */
+#define TEMP_RISE_WAKE_CENTI 200
+#define TEMP_FALL_SLEEP_CENTI 200
 
 /*
  * 功能测试模式：不休眠，一直保持可连接广播，数据每 5 秒刷一次，
@@ -591,6 +611,14 @@ static bool bat_trend_valid;     /* 是否已经打过基准 */
 static uint8_t bat_charge_state = BAT_STATE_UNKNOWN;
 /* 上一次看到的 VBUS 状态，-1 = 还没看过。用来在插拔瞬间立刻出结论 */
 static int8_t bat_last_vbus = -1;
+
+/*
+ * 温度突变爬升 → 常醒（不再休眠），直到温度出现突变跌落才清掉。
+ * 睡眠期间也会每 30 秒采一次温度来喂这个判断。
+ */
+static bool temp_rising;
+static bool temp_prev_valid;
+static int16_t temp_prev_centi;
 
 /* 1 = 允许休眠（正常 10 分钟周期），0 = 测试模式常醒 */
 static bool sleep_enabled = !STAY_AWAKE_DEFAULT;
@@ -2097,6 +2125,61 @@ static int sample_ntc(struct ntc_capture *capture)
 	return 0;
 }
 
+/*
+ * 睡眠期间快速查一下有没有插充电器：只读 VBUS 那一路（4 次取平均），
+ * 不做 NTC、不碰电池、不开广播。
+ */
+static bool vbus_present_now(void)
+{
+	uint32_t sum = 0U;
+	uint16_t count = 0U;
+	int32_t mv;
+
+	if (!vbus_adc_ready) {
+		return false;
+	}
+
+	for (int i = 0; i < 4; i++) {
+		if (read_adc_mv(&vbus_adc, &mv) == 0) {
+			sum += (uint16_t)CLAMP(mv, 0, UINT16_MAX);
+			count++;
+		}
+	}
+
+	if (count == 0U) {
+		return false;
+	}
+
+	uint32_t vin = (uint32_t)(((uint64_t)(sum / count) * vbus_div_permille) / 1000U);
+
+	return (vin > VBUS_PRESENT_MIN_MV && vin < VBUS_PRESENT_MAX_MV);
+}
+
+/*
+ * 温度趋势：一次采样涨 TEMP_RISE_WAKE_CENTI 以上 → temp_rising（常醒）；
+ * 一次采样跌 TEMP_FALL_SLEEP_CENTI 以上 → 立刻清掉，回去睡。
+ * 采样失败时 temp_centi 是 INT16_MIN，直接跳过，别污染趋势。
+ */
+static void temp_trend_update(int16_t centi)
+{
+	if (centi <= -30000) {
+		return;
+	}
+
+	if (temp_prev_valid) {
+		int32_t delta = (int32_t)centi - (int32_t)temp_prev_centi;
+
+		if (delta >= TEMP_RISE_WAKE_CENTI) {
+			temp_rising = true;
+		} else if (delta <= -TEMP_FALL_SLEEP_CENTI) {
+			temp_rising = false;
+		}
+	}
+
+	temp_prev_centi = centi;
+	temp_prev_valid = true;
+}
+
 static void set_error_capture(struct ntc_capture *capture, int error)
 {
 	uint32_t code = error < 0 ? (uint32_t)-error : (uint32_t)error;
@@ -2611,6 +2694,8 @@ int main(void)
 				LOG_WRN("NTC sample failed: %d", ret);
 				set_error_capture(&capture, ret);
 			}
+			/* 喂温度趋势：突变爬升 → 常醒，突变跌落 → 回睡 */
+			temp_trend_update(capture.temp_centi);
 		}
 
 		/*
@@ -2636,18 +2721,19 @@ int main(void)
 		publish_sensors(&capture, &ip);
 
 		/*
-		 * 充电中不休眠：插着充电器时输入电源一直在，没必要省电，
-		 * 而且这会儿最需要实时看数据。判据和 BTHome 的 0x16 一致
-		 * （CHARGING 或 FULL），它是 VBUS 一变化就立刻更新的，不用等窗口。
+		 * 两种"不休眠"的情况：
+		 *   1. 充电中（CHARGING / FULL）—— 插着充电器就不睡，拔掉立刻回睡眠
+		 *   2. 温度突变爬升（temp_rising）—— 一直常醒，直到温度突变跌落
+		 * 判据和 BTHome 的 0x16 一致，VBUS 一变化就立刻更新，不用等窗口。
 		 */
 		bool charging = (bat_charge_state == BAT_STATE_CHARGING ||
 				 bat_charge_state == BAT_STATE_FULL);
 
-		if (!sleep_enabled || charging) {
+		if (!sleep_enabled || charging || temp_rising) {
 			/*
 			 * 常醒：广播不收，一直保持可连接，数据每 5 秒刷一次，
 			 * 按一下键也能立刻刷。想回正常休眠就往 "Sleep enable" 写 1
-			 * （充电中写了也不睡，拔掉充电器才生效）。
+			 * （充电中 / 温度爬升时写了也不睡，条件消失才生效）。
 			 */
 			(void)start_advertising();
 			(void)k_sem_take(&wake_sem, TEST_SAMPLE_INTERVAL);
@@ -2657,7 +2743,39 @@ int main(void)
 
 			LOG_INF("idle, wait up to %d min or KEY (count=%u)", 10,
 				key_wake_count);
-			(void)k_sem_take(&wake_sem, SAMPLE_INTERVAL);
+
+			/*
+			 * 睡着期间也要能"马上"发现插充电器 / 温度突变：
+			 * 每 SLEEP_POLL_MS 读一次 VBUS，每 SLEEP_TEMP_TICKS 次再采一次
+			 * 完整数据判温度。命中就 break 出去 —— 外层循环重新采样，
+			 * 再按上面的条件进常醒分支。按键唤醒同样 break。
+			 */
+			int64_t deadline = k_uptime_get() + (int64_t)SAMPLE_INTERVAL_MS;
+			uint32_t tick = 0U;
+
+			while (k_uptime_get() < deadline) {
+				if (k_sem_take(&wake_sem, SLEEP_POLL_MS) == 0) {
+					break;
+				}
+
+				if (vbus_present_now()) {
+					LOG_INF("插上充电器 → 立刻醒");
+					break;
+				}
+
+				if (++tick >= SLEEP_TEMP_TICKS) {
+					struct ntc_capture tmp;
+
+					tick = 0U;
+					if (sample_ntc(&tmp) == 0) {
+						temp_trend_update(tmp.temp_centi);
+						if (temp_rising) {
+							LOG_INF("温度突变爬升 → 立刻醒");
+							break;
+						}
+					}
+				}
+			}
 		}
 
 		/* 按键机械抖动，等电平稳定后再采样 */
