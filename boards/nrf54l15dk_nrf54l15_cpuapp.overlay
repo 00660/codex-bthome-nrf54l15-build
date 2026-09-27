@@ -16,7 +16,7 @@
 	};
 
 	zephyr,user {
-		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>, <&adc 4>;
+		io-channels = <&adc 0>, <&adc 1>, <&adc 2>, <&adc 3>;
 	};
 };
 
@@ -108,25 +108,11 @@
 	 * 4 脚（电池）旁边，接线最顺手。16 脚当初只是因为 5/6/7 都被占了
 	 * 才选的，现在没必要。
 	 *
-	 * 拔掉充电器时这一脚被 100k 拉到地（0V）。就算线没接/虚焊，固件里
-	 * 还有两道闸门拦着（区间 + 窗口内跳动量），见 src/main.c 的
-	 * VBUS_ADC_ENABLE。
+	 * 快充砍掉之后输入只可能是普通 5V，这一脚实测就两个状态：
+	 *   插着 ≈ 418mV（反算 4.60V），没插 ≈ 327mV（反算 3.59V）。
+	 * 固件按"反算回输入端的电压 > 3.6V 且 < 5V"判定，
+	 * 见 src/main.c 的 VBUS_PRESENT_MIN_MV。
 	 */
-	/*
-	 * 模组第 7 脚 = P1.04 = AIN0：纯诊断通道，只读分压点原始 mV。
-	 * 目的：和模组第 6 脚（P1.14 / AIN7）对比，确认充电输入的那根分压线
-	 * 到底焊在 6 脚还是 7 脚上。不参与任何控制逻辑。
-	 */
-	channel@4 {
-		reg = <4>;
-		zephyr,gain = "ADC_GAIN_1_4";
-		zephyr,reference = "ADC_REF_INTERNAL";
-		zephyr,vref-mv = <900>;
-		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
-		zephyr,input-positive = <NRF_SAADC_AIN0>;
-		zephyr,resolution = <12>;
-	};
-
 	channel@3 {
 		reg = <3>;
 		zephyr,gain = "ADC_GAIN_1_4";
