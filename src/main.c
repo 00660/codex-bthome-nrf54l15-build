@@ -374,6 +374,8 @@ static volatile uint32_t key_wake_count;
  */
 static bool diag_ran;
 static uint32_t diag_key_count;
+/* 本次诊断是不是被第 8 脚按键唤醒触发的（上电那次不算） */
+static bool diag_from_key;
 
 /*
  * BTHome service data，18 字节：
@@ -958,11 +960,13 @@ static void ip_line_probe(uint32_t pin, uint8_t *low_release, uint8_t *high_rele
 }
 
 /*
- * 布局（24 字节）。
+ * 布局（34 字节）。
  * 接线顺序已定死：模组 5 脚(P1.13) = SCL，6 脚(P1.14) = SDA，不再试别的组合。
  *
  *   [0]     标志：bit0 已跑过，bit1 2µs ACK，bit2 20µs ACK，bit3 100µs ACK，
- *                bit4 总线恢复后 SDA 仍被拉低（从机卡住总线）
+ *                bit4 总线恢复后 SDA 仍被拉低（从机卡住总线），
+ *                bit5 本次诊断是【第 8 脚按键唤醒】触发的（上电那次是 0）
+ *                —— 按一下实体键再读，bit5 变 1 就证明按键唤醒真的通了
  *   [1]     INT/RSET(P1.04) 电平，1 = 主板醒着
  *   [2..3]  SCL/SDA 纯高阻电平
  *   [4..5]  SCL/SDA 内部上拉电平
@@ -1097,7 +1101,8 @@ static void ip5328_diag_run(void)
 	ip5328_diag[0] = (uint8_t)(1U | (ip5328_diag[10] == 0 ? 0x02U : 0U) |
 				   (ip5328_diag[11] == 0 ? 0x04U : 0U) |
 				   (ip5328_diag[12] == 0 ? 0x08U : 0U) |
-				   (ip_sda_get() ? 0U : 0x10U));
+				   (ip_sda_get() ? 0U : 0x10U) |
+				   (diag_from_key ? 0x20U : 0U));
 	ip5328_diag[13] = n_fast;
 	ip5328_diag[14] = first_fast;
 	ip5328_diag[15] = n_slow;
@@ -1988,6 +1993,12 @@ int main(void)
 		 * 按一下充电宝的键就能拿到一份最新的总线状态。
 		 */
 		if (!diag_ran || key_wake_count != diag_key_count) {
+			/*
+			 * 不是上电后第一次、而是按键把它叫起来的 → 打上 bit5 标记。
+			 * 这样按一下实体键再读诊断，就能确认第 8 脚唤醒真的通了：
+			 * [0] 的 bit5 从 0 变 1 就是证据。
+			 */
+			diag_from_key = diag_ran;
 			ip5328_diag_run();
 			diag_key_count = key_wake_count;
 			diag_ran = true;
