@@ -226,6 +226,12 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BAT_FULL_MV 4150U
 
 /*
+ * 拔掉充电器后等这么久，才把电池电压当成 OCV（开路电压）来用。
+ * 刚拔线时电芯还挂着表面电荷，读数偏高几十 mV，等一会儿才准。
+ */
+#define BAT_OCV_SETTLE_MS (60 * 1000)
+
+/*
  * 判满还要求"电压不再涨"（见 bat_update_charge_state 里的 !moving）。
  * 因为恒流充到 4.2V 时电压还在爬，只有进恒压阶段、电流掉下来，
  * 电压才会真正钉住不动 —— 那才是真满。
@@ -258,19 +264,27 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  *   充电输入 ──[1MΩ]──┬── 模组第 6 脚 (P1.14/AIN7)
  *                     └──[100kΩ]── GND      （再并一颗电容到 GND）
  *
- * 快充砍掉之后输入只可能是普通 5V，实测这一脚就两个状态：
+ * 实测这一脚就两个状态：
  *
- *   插着充电器 ≈ 418mV（反算 4.60V）
- *   没插       ≈ 327mV（反算 3.59V）
+ *   插着充电器 ≈ 418mV
+ *   没插       ≈ 327mV
  *
- * 判定规则：反算回输入端的电压 **> 3.6V 且 < 5V** 才算插着充电器。
- *   低于 3.6V → 没插；高于 5V → 读数不可信（悬空脚乱飘），一样不算。
- * 原来那套 [250mV, 2800mV] 原始区间 + 30mV 抖动闸门是为了兼容 9/12/20V
- * 快充档位、以及防悬空脚乱飘，现在都不需要了。
+ * ★ 判定规则：**只看第 6 脚的原始 mV**，带 20mV 死区防抖：
+ *
+ *      ≥ 375mV → 插着充电器
+ *      ≤ 355mV → 拔了
+ *      中间    → 保持上一次的结论（噪声不翻状态）
+ *
+ *   不反算、不套分压比 —— 分压比写错了也不影响"插没插"这个判断。
+ *
+ * ⚠️ 以前是拿"反算回输入端的电压"卡 (3.6V, 5V) 开区间，而 327mV × 11 =
+ *    3597mV 正好压在那条 3600mV 线上，**余量只剩 3mV**（不到 4 个 ADC 码）。
+ *    ADC 抖一下、或者分压比写大一点，拔了充电器照样显示"充电中"，
+ *    插拔反馈时好时坏、设备死活不进休眠，根子都在这儿。
  */
 #define VBUS_ADC_ENABLE 1
-#define VBUS_PRESENT_MIN_MV 3600U
-#define VBUS_PRESENT_MAX_MV 5000U
+#define VBUS_PIN_PRESENT_MV 375U /* 6 脚 ≥ 这个值 → 插着充电器 */
+#define VBUS_PIN_ABSENT_MV 355U  /* 6 脚 ≤ 这个值 → 拔了；中间保持原状态 */
 
 /*
  * 分压比，用来把 ADC 读到的分压值**反算回输入端真实电压**，
@@ -313,11 +327,11 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 
 /*
  * 休眠期间的轮询（拔掉充电器后才用得上）：
- *   每 SLEEP_POLL_MS 只读一次充电器 VBUS —— 插上就立刻醒，不等 10 分钟。
- *   每 SLEEP_TEMP_TICKS 次轮询（2s × 15 = 30s）采一次完整数据判温度突变。
+ *   每 SLEEP_POLL_MS（1 秒）只读一次第 6 脚 —— 插拔立刻发现，不等 10 分钟。
+ *   每 SLEEP_TEMP_TICKS 次轮询（1s × 15 = 15s）采一次完整数据判温度突变。
  * 单通道 ADC 读一次不到 1ms，平均功耗远低于常醒广播，可以放心轮。
  */
-#define SLEEP_POLL_MS K_SECONDS(2)
+#define SLEEP_POLL_MS K_SECONDS(1)
 #define SLEEP_TEMP_TICKS 15U
 
 /*
@@ -326,6 +340,14 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  */
 #define TEMP_RISE_WAKE_CENTI 200
 #define TEMP_FALL_SLEEP_CENTI 200
+/*
+ * 爬升之后"常醒"保持多久（每次新的爬升续期）。
+ *
+ * ★ 以前这里是个**永久锁存**：爬升之后必须来一次单次 -2°C 的跳变才解锁，
+ *   而环境温度只会慢慢降（每次采样差 0.1°C 量级），根本凑不出来 ——
+ *   设备被一次采样噪声顶上去就再也不会休眠了。改成限时保持就没事了。
+ */
+#define TEMP_RISE_HOLD_MS (10U * 60U * 1000U)
 
 /*
  * 功能测试模式：不休眠，一直保持可连接广播，数据每 5 秒刷一次，
@@ -424,6 +446,13 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 	BT_UUID_128_ENCODE(0x6F6B0303, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 #define APP_VBUS_DIV_UUID_VAL \
 	BT_UUID_128_ENCODE(0x6F6B0304, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
+/*
+ * 6F6B0305 = 第 6 脚原始 mV（只读，uint16 小端）
+ * 就是把"判插没插"用的那个数直接摊开看：插着 ≈418mV / 没插 ≈327mV。
+ * 阈值要不要动（VBUS_PIN_PRESENT_MV / VBUS_PIN_ABSENT_MV），看它就够了。
+ */
+#define APP_VBUS_PIN_UUID_VAL \
+	BT_UUID_128_ENCODE(0x6F6B0305, 0x8C9A, 0x4CC4, 0xA848, 0x16B7E44F5415)
 
 /* ---------------- GPIO 测试开关 ---------------- */
 
@@ -480,7 +509,14 @@ struct ntc_capture {
 	/* 模组第 4 脚 (P1.12/AIN5) 分压后测到的电池电压，已换算回 BAT 端 */
 	uint16_t bat_mv;
 	uint16_t bat_raw_mv;
-	/* 模组第 6 脚 (P1.14/AIN7) 分压后测到的充电器输入电压（未换算回 VBUS 端） */
+	/*
+	 * 拿来算电量（SOC）的电压。
+	 * 没插充电器时 = bat_mv；充电中 = 上次拔线后的读数（OCV）。
+	 * 原因：充电时电池分压点被顶到充电电压（CV 阶段的 4.2V），
+	 * 那是充电器给的，不是电芯自己的电压，拿它算电量会虚高。
+	 */
+	uint16_t bat_soc_mv;
+	/* 模组第 6 脚 (P1.14/AIN7) 的原始 mV；没插充电器时为 0（插没插就看它） */
 	uint16_t vbus_mv;
 	/* 上一个值反算回输入端的真实电压（mV）。没插充电器时为 0 */
 	uint16_t vbus_in_mv;
@@ -594,6 +630,7 @@ static const struct bt_uuid_128 app_version_uuid = BT_UUID_INIT_128(APP_VERSION_
 static const struct bt_uuid_128 app_sleep_uuid = BT_UUID_INIT_128(APP_SLEEP_UUID_VAL);
 static const struct bt_uuid_128 app_bat_div_uuid = BT_UUID_INIT_128(APP_BAT_DIV_UUID_VAL);
 static const struct bt_uuid_128 app_vbus_div_uuid = BT_UUID_INIT_128(APP_VBUS_DIV_UUID_VAL);
+static const struct bt_uuid_128 app_vbus_pin_uuid = BT_UUID_INIT_128(APP_VBUS_PIN_UUID_VAL);
 
 BUILD_ASSERT(ARRAY_SIZE(gpio_switches) == GPIO_SWITCH_COUNT);
 
@@ -601,6 +638,10 @@ static bool connected;
 static bool vdd_adc_ready;
 static bool bat_adc_ready;
 static bool vbus_adc_ready;
+/* 第 6 脚判出来的当前结论（滞回状态）：true = 插着充电器 */
+static bool vbus_pin_present;
+/* 第 6 脚最近一次读到的原始 mV，只读特征 0305 给手机端看，也方便对着实测调阈值 */
+static uint16_t vbus_pin_mv_now;
 static int16_t adc_sample_buffer[2];
 
 /* 电池电压(mV) → 电量百分比，查 soc_table[] 放电曲线。实现在下面 */
@@ -620,10 +661,19 @@ static uint8_t bat_charge_state = BAT_STATE_UNKNOWN;
 static int8_t bat_last_vbus = -1;
 
 /*
- * 温度突变爬升 → 常醒（不再休眠），直到温度出现突变跌落才清掉。
- * 睡眠期间也会每 30 秒采一次温度来喂这个判断。
+ * 电芯开路电压（OCV）：只在**没插充电器**时更新，用来算电量。
+ * 拔线后表面电荷要几秒到几分钟才散掉，所以拔线瞬间起先等
+ * BAT_OCV_SETTLE_MS 再开始采信读数。
  */
-static bool temp_rising;
+static uint16_t bat_ocv_mv;
+static bool bat_ocv_valid;
+static int64_t bat_ocv_not_before;
+
+/*
+ * 温度突变爬升 → 常醒一段时间（TEMP_RISE_HOLD_MS，每次新爬升续期），
+ * 出现一次突变跌落就立刻清掉。睡眠期间每 30 秒采一次温度来喂它。
+ */
+static int64_t temp_rise_until;
 static bool temp_prev_valid;
 static int16_t temp_prev_centi;
 
@@ -1586,8 +1636,11 @@ static void ip5328_encode_report(const struct ip5328_data *d, const struct ntc_c
 					     (ntc->bat_detect == BAT_DETECT_OVERRANGE ? 0x20U : 0U) |
 					     (ntc->charge_state == BAT_STATE_FULL ? 0x40U : 0U));
 		ip5328_report[2] = (uint8_t)(ntc->charge_state & 0x07U);
-		ip5328_report[3] = soc_from_mv(ntc->bat_mv);
-		sys_put_le16(ntc->bat_mv, &ip5328_report[4]);
+		/* 报出去的是 OCV（充电中 = 上次拔线后的读数），不是被顶高的那一下 */
+		uint16_t soc_mv = ntc->bat_soc_mv > 0U ? ntc->bat_soc_mv : ntc->bat_mv;
+
+		ip5328_report[3] = soc_from_mv(soc_mv);
+		sys_put_le16(soc_mv, &ip5328_report[4]);
 		sys_put_le16(ntc->bat_raw_mv, &ip5328_report[6]);
 		sys_put_le16(ntc->vbus_mv, &ip5328_report[8]);
 		sys_put_le16(ntc->charge_state, &ip5328_report[10]);
@@ -1908,6 +1961,8 @@ static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 			 * 而广播把 FULL 也当成"插着充电器"，于是拔了线还显示充电中。
 			 */
 			bat_charge_state = BAT_STATE_IDLE;
+			/* 刚拔线，表面电荷还没散，先别急着把读数当 OCV */
+			bat_ocv_not_before = k_uptime_get() + BAT_OCV_SETTLE_MS;
 		}
 
 		LOG_INF("charge state -> %u (vbus=%u, 立即判定)", bat_charge_state, vbus_present);
@@ -1956,6 +2011,31 @@ static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 	bat_trend_ms = now;
 	bat_trend_sum = 0U;
 	bat_trend_count = 0U;
+}
+
+/*
+ * 第 6 脚（充电输入分压点）的原始 mV → 插没插充电器。
+ *
+ * 带 20mV 死区：≥375mV 判"插着"，≤355mV 判"拔了"，中间保持上一次的结论。
+ * 实测两个状态是 418mV / 327mV，离阈值都有 30mV 以上，而这条线上的噪声
+ * 只有 1~2mV —— 不会像以前那条只剩 3mV 余量的线一样乱翻。
+ *
+ * 唯一出口：sample_ntc() 的采样和睡眠轮询都走它，状态只有一份，
+ * 不会出现"采样说插着、轮询说没插"这种自相矛盾。
+ *
+ * 返回 true = 插着充电器。
+ */
+static bool vbus_pin_update(uint16_t pin_mv)
+{
+	vbus_pin_mv_now = pin_mv;
+
+	if (pin_mv >= VBUS_PIN_PRESENT_MV) {
+		vbus_pin_present = true;
+	} else if (pin_mv <= VBUS_PIN_ABSENT_MV) {
+		vbus_pin_present = false;
+	}
+
+	return vbus_pin_present;
 }
 
 static int sample_ntc(struct ntc_capture *capture)
@@ -2120,23 +2200,34 @@ static int sample_ntc(struct ntc_capture *capture)
 	}
 
 	/*
-	 * 充电器输入：反算回输入端的电压落在 (3.6V, 5V) 开区间内才算插着。
-	 * 没插 ≈3.59V、插着 ≈4.60V，见 VBUS_PRESENT_MIN_MV。
+	 * 充电器输入：**只看第 6 脚原始 mV**（阈值见 VBUS_PIN_PRESENT_MV）。
+	 * 插着才写 vbus_mv —— 充电状态就是按"vbus_mv 是不是 0"判的。
 	 */
 	if (vbus_count > 0U) {
 		uint16_t avg = (uint16_t)(vbus_sum / vbus_count);
-		/* 分压比走运行期可调的千分比（0304 特征） */
-		uint32_t vin = (uint32_t)(((uint64_t)avg * vbus_div_permille) / 1000U);
 
-		if (vin > VBUS_PRESENT_MIN_MV && vin < VBUS_PRESENT_MAX_MV) {
+		if (vbus_pin_update(avg)) {
 			capture->vbus_mv = avg;
-			/*
-			 * 判为插着才记下反算值。广播里已经不报这个电压了，
-			 * 只留给日志看（想知道插着时输入端到底多少 V）。
-			 */
-			capture->vbus_in_mv = (uint16_t)MIN(vin, UINT16_MAX);
+			/* 反算值只留给日志/调试看（分压比走 0304 特征可调） */
+			capture->vbus_in_mv = (uint16_t)MIN(
+				(uint32_t)(((uint64_t)avg * vbus_div_permille) / 1000U),
+				UINT16_MAX);
 		}
 	}
+
+	/*
+	 * ★ 充电时电池分压点会被顶到充电电压（恒压阶段就是 4.2V），那不是电芯电压 ——
+	 *   只有拔掉充电器、并且等表面电荷散掉之后的读数才是真正的电池电压。
+	 *   所以：没插充电器且过了结算时间才刷新 OCV；充电中沿用上次的 OCV。
+	 *   这样电量不会因为"充电器把电压顶高"而瞬间盐到 100%。
+	 */
+	if (capture->vbus_mv == 0U && capture->bat_detect == BAT_DETECT_OK &&
+	    capture->bat_mv > 0U && k_uptime_get() >= bat_ocv_not_before) {
+		bat_ocv_mv = capture->bat_mv;
+		bat_ocv_valid = true;
+	}
+
+	capture->bat_soc_mv = bat_ocv_valid ? bat_ocv_mv : capture->bat_mv;
 
 	bat_update_charge_state(capture->bat_mv, capture->vbus_mv != 0U);
 	capture->charge_state = bat_charge_state;
@@ -2146,7 +2237,10 @@ static int sample_ntc(struct ntc_capture *capture)
 
 /*
  * 睡眠期间快速查一下有没有插充电器：只读 VBUS 那一路（4 次取平均），
- * 不做 NTC、不碰电池、不开广播。
+ * 不做 NTC、不碰电池、不动广播。
+ *
+ * 判定和 sample_ntc() 共用 vbus_pin_update()（同一份滞回状态），
+ * 所以一个插拔边沿只会被认到一次，不会出现两边结论相反。
  */
 static bool vbus_present_now(void)
 {
@@ -2155,7 +2249,7 @@ static bool vbus_present_now(void)
 	int32_t mv;
 
 	if (!vbus_adc_ready) {
-		return false;
+		return vbus_pin_present;
 	}
 
 	for (int i = 0; i < 4; i++) {
@@ -2166,17 +2260,16 @@ static bool vbus_present_now(void)
 	}
 
 	if (count == 0U) {
-		return false;
+		/* 读失败就沿用上一次的结论，别把状态翻成"没插" */
+		return vbus_pin_present;
 	}
 
-	uint32_t vin = (uint32_t)(((uint64_t)(sum / count) * vbus_div_permille) / 1000U);
-
-	return (vin > VBUS_PRESENT_MIN_MV && vin < VBUS_PRESENT_MAX_MV);
+	return vbus_pin_update((uint16_t)(sum / count));
 }
 
 /*
- * 温度趋势：一次采样涨 TEMP_RISE_WAKE_CENTI 以上 → temp_rising（常醒）；
- * 一次采样跌 TEMP_FALL_SLEEP_CENTI 以上 → 立刻清掉，回去睡。
+ * 温度趋势：一次采样涨 TEMP_RISE_WAKE_CENTI 以上 → 常醒 TEMP_RISE_HOLD_MS
+ * （每次新爬升续期）；一次采样跌 TEMP_FALL_SLEEP_CENTI 以上 → 立刻清掉回睡。
  * 采样失败时 temp_centi 是 INT16_MIN，直接跳过，别污染趋势。
  */
 static void temp_trend_update(int16_t centi)
@@ -2189,14 +2282,20 @@ static void temp_trend_update(int16_t centi)
 		int32_t delta = (int32_t)centi - (int32_t)temp_prev_centi;
 
 		if (delta >= TEMP_RISE_WAKE_CENTI) {
-			temp_rising = true;
+			temp_rise_until = k_uptime_get() + TEMP_RISE_HOLD_MS;
 		} else if (delta <= -TEMP_FALL_SLEEP_CENTI) {
-			temp_rising = false;
+			temp_rise_until = 0;
 		}
 	}
 
 	temp_prev_centi = centi;
 	temp_prev_valid = true;
+}
+
+/* 温度突变爬升的"常醒"是否还在有效期内 */
+static bool temp_rising_active(void)
+{
+	return k_uptime_get() < temp_rise_until;
 }
 
 static void set_error_capture(struct ntc_capture *capture, int error)
@@ -2218,12 +2317,13 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	if (ip->valid) {
 		soc = ip->soc;
 		volt_mv = ip->batocv_mv;
-	} else if (ntc->bat_mv > 0U) {
+	} else if (ntc->bat_soc_mv > 0U || ntc->bat_mv > 0U) {
 		/*
-		 * I2C 不通，但模组第 4 脚的分压接上了 —— 用 ADC 实测的电池电压。
-		 * 这是兜底：只有电压，没有电流/功率/充电状态。
+		 * I2C 不通，用 ADC 实测的电压。
+		 * ★ 用 bat_soc_mv：充电中它会退回上次拔线后的 OCV，
+		 *   免得把充电器顶上去的 4.2V 当成电芯电压，电量虚高。
 		 */
-		volt_mv = ntc->bat_mv;
+		volt_mv = ntc->bat_soc_mv > 0U ? ntc->bat_soc_mv : ntc->bat_mv;
 		soc = soc_from_mv(volt_mv);
 	} else {
 		/* 分压也没接，只能拿模组自己的供电电压充数（不是电池电压） */
@@ -2265,8 +2365,8 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	LOG_INF("temp=%d.%02dC ntc=%uohm adc=%umV vdd=%umV samples=%u", ntc->temp_centi / 100,
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
-	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u detect=%s", ntc->bat_raw_mv, ntc->bat_mv,
-		soc, bat_detect_name(ntc->bat_detect));
+	LOG_INF("batadc raw=%umV -> bat=%umV (soc 用 %umV) soc=%u detect=%s", ntc->bat_raw_mv,
+		ntc->bat_mv, ntc->bat_soc_mv, soc, bat_detect_name(ntc->bat_detect));
 	LOG_INF("vbus=%umV(%umV) charge_state=%u  0x4A 填 %u(0.1V档,=%umV)",
 		ntc->vbus_mv, ntc->vbus_in_mv, ntc->charge_state,
 		ntc->bat_mv / BATTERY_VOLTAGE_DECIVOLTS_DIV, ntc->bat_mv);
@@ -2447,6 +2547,16 @@ static ssize_t write_sleep_enable(struct bt_conn *conn, const struct bt_gatt_att
 	return len;
 }
 
+/* 第 6 脚原始 mV（只读）。判插拔就靠这个数，所以给它一个能直接读的窗口 */
+static ssize_t read_vbus_pin(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset)
+{
+	ARG_UNUSED(attr);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &vbus_pin_mv_now,
+				 sizeof(vbus_pin_mv_now));
+}
+
 #define GPIO_SWITCH_GATT_ENTRY(index, port_node, pin_number, label) \
 	BT_GATT_CHARACTERISTIC(&gpio_switch_uuid_##index.uuid, \
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE, \
@@ -2502,6 +2612,9 @@ BT_GATT_SERVICE_DEFINE(app_info_service,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 			       read_voltage_cal, write_voltage_cal, &vbus_div_permille),
 	BT_GATT_CUD("VBUS divider x1000", BT_GATT_PERM_READ),
+	BT_GATT_CHARACTERISTIC(&app_vbus_pin_uuid.uuid, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_vbus_pin, NULL, NULL),
+	BT_GATT_CUD("Pin6 raw mV", BT_GATT_PERM_READ),
 );
 
 static void configure_gpio_switches(void)
@@ -2530,23 +2643,87 @@ static void configure_gpio_switches(void)
 /*
  * 广播始终保持可连接：OTA 客户端是"轮询扫描 + 撞上窗口就连"，
  * 所以任何一个广播窗口都必须允许连接，不能只在 OTA 窗口期才可连。
+ *
+ * 两种参数：
+ *   ADV_FAST —— 20ms 一条、可连接（BT_LE_ADV_CONN_FAST_2）：
+ *               常醒 / 充电中 / 开机后 / OTA 窗口用，随时连得上，最费电。
+ *   ADV_SLOW —— 1 秒一条、仍然可连接：休眠期间用。HA 那边电量/充电状态
+ *               一直是新鲜的（插拔也立刻刷新），也不会因为"3 分钟没广播"
+ *               被标成不可用；平均电流只有快播的 2%，该睡照睡。
  */
-static int start_advertising(void)
+enum adv_mode {
+	ADV_OFF,
+	ADV_FAST,
+	ADV_SLOW,
+};
+
+static enum adv_mode adv_current = ADV_OFF;
+
+static const struct bt_le_adv_param *adv_param_for(enum adv_mode mode)
+{
+	if (mode == ADV_FAST) {
+		/* 数组形式的复合字面量，取首元素地址 */
+		return &BT_LE_ADV_CONN_FAST_2[0];
+	}
+
+	/* 1 秒一条（0x0640 = 1600 × 0.625ms）、可连接、无超时 */
+	return &BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, 0x0640, 0x0640, NULL)[0];
+}
+
+/*
+ * 切到指定广播模式（同一个模式就只把 payload 重发一遍）。
+ *
+ * 广播数据是原地改的（bthome_service_data[]），所以每刷新一次值就必须再调
+ * 一次 start/update，新数据才能真的发出去。
+ * ★ 同一个模式时不能只调 bt_le_adv_update_data：有人连上来时控制器会自动
+ *   停掉广播，只有再 start 一次才能恢复可连接（以前那条老路就是这么写的）。
+ */
+static int adv_apply(enum adv_mode mode)
 {
 	int ret;
 
-	ret = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (ret == -EALREADY) {
-		ret = bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+	if (mode == adv_current) {
+		if (mode == ADV_OFF) {
+			return 0;
+		}
+
+		ret = bt_le_adv_start(adv_param_for(mode), ad, ARRAY_SIZE(ad), sd,
+				      ARRAY_SIZE(sd));
+		if (ret == -EALREADY) {
+			ret = bt_le_adv_update_data(ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+		}
+	} else {
+		if (adv_current != ADV_OFF) {
+			(void)bt_le_adv_stop();
+			adv_current = ADV_OFF;
+		}
+
+		if (mode == ADV_OFF) {
+			return 0;
+		}
+
+		ret = bt_le_adv_start(adv_param_for(mode), ad, ARRAY_SIZE(ad), sd,
+				      ARRAY_SIZE(sd));
 	}
 
 	if (ret) {
-		LOG_ERR("advertising start/update failed: %d", ret);
+		LOG_ERR("advertising (mode %u) failed: %d", (unsigned int)mode, ret);
 		return ret;
 	}
 
-	LOG_INF("advertising as %s", DEVICE_NAME);
+	if (adv_current != mode) {
+		adv_current = mode;
+		LOG_INF("advertising as %s (%s)", DEVICE_NAME,
+			mode == ADV_FAST ? "fast 20ms" : "slow 1s");
+	}
+
 	return 0;
+}
+
+/* 常醒 / 充电中 / OTA 窗口：20ms 快速可连接广播 */
+static int start_advertising(void)
+{
+	return adv_apply(ADV_FAST);
 }
 
 /*
@@ -2555,7 +2732,7 @@ static int start_advertising(void)
  */
 static void advertise_then_stop(k_timeout_t duration)
 {
-	int ret = start_advertising();
+	int ret = adv_apply(ADV_FAST);
 	uint32_t waited_s = 0U;
 
 	if (ret) {
@@ -2577,7 +2754,7 @@ static void advertise_then_stop(k_timeout_t duration)
 		LOG_WRN("client still connected, dropping the window");
 	}
 
-	(void)bt_le_adv_stop();
+	(void)adv_apply(ADV_OFF);
 }
 
 static void connected_cb(struct bt_conn *conn, uint8_t err)
@@ -2747,46 +2924,69 @@ int main(void)
 		publish_sensors(&capture, &ip);
 
 		/*
-		 * 两种"不休眠"的情况：
-		 *   1. 充电中（CHARGING / FULL）—— 插着充电器就不睡，拔掉立刻回睡眠
-		 *   2. 温度突变爬升（temp_rising）—— 一直常醒，直到温度突变跌落
-		 * 判据和 BTHome 的 0x16 一致，VBUS 一变化就立刻更新，不用等窗口。
+		 * 什么时候不休眠：
+		 *   1. 充电中（CHARGING / FULL）—— 插着充电器就不睡（反正有外电），
+		 *      数据 5 秒一刷，拔掉立刻回休眠周期
+		 *   2. 温度突变爬升后的 10 分钟内（TEMP_RISE_HOLD_MS）
+		 * 充电状态只看第 6 脚电压（vbus_mv），插拔一变化就立刻出结论。
 		 */
 		bool charging = (bat_charge_state == BAT_STATE_CHARGING ||
 				 bat_charge_state == BAT_STATE_FULL);
 
-		if (!sleep_enabled || charging || temp_rising) {
+		if (!sleep_enabled || charging || temp_rising_active()) {
 			/*
-			 * 常醒：广播不收，一直保持可连接，数据每 5 秒刷一次，
+			 * 常醒：20ms 快速可连接广播不收，数据每 5 秒刷一次，
 			 * 按一下键也能立刻刷。想回正常休眠就往 "Sleep enable" 写 1
 			 * （充电中 / 温度爬升时写了也不睡，条件消失才生效）。
 			 */
 			(void)start_advertising();
 			(void)k_sem_take(&wake_sem, TEST_SAMPLE_INTERVAL);
 		} else {
-			/* OTA 窗口：这段时间可连接广播，电脑端轮询到就能刷机 */
+			/* OTA 窗口：20ms 快速可连接广播，电脑端轮询到就能刷机 */
 			advertise_then_stop(K_SECONDS(OTA_WINDOW_SECONDS));
+
+			/*
+			 * ★ 平时（休眠期间）**不静音**：切成 1 秒一条的慢速广播。
+			 *   以前这里一停广播就是 8 分钟，HA 那边电量/充电状态全冻住，
+			 *   3 分钟收不到还直接标成"不可用" —— 插拔反馈"不实时"一半是
+			 *   这么来的。慢速广播平均只有几 µA，该睡照睡。
+			 */
+			(void)adv_apply(ADV_SLOW);
 
 			LOG_INF("idle, wait up to %d min or KEY (count=%u)", 10,
 				key_wake_count);
 
 			/*
-			 * 睡着期间也要能"马上"发现插充电器 / 温度突变：
-			 * 每 SLEEP_POLL_MS 读一次 VBUS，每 SLEEP_TEMP_TICKS 次再采一次
-			 * 完整数据判温度。命中就 break 出去 —— 外层循环重新采样，
-			 * 再按上面的条件进常醒分支。按键唤醒同样 break。
+			 * 睡着期间也要能"马上"发现插拔 / 温度突变：
+			 *   每 SLEEP_POLL_MS（1 秒）读一次第 6 脚 —— 电压一变就立刻完整采样
+			 *   + 刷新广播；插上就 break 出去进常醒分支，拔掉当场改报未充电。
+			 *   每 SLEEP_TEMP_TICKS 次（15 秒）采一次完整数据：喂温度趋势，
+			 *   顺带刷新广播（HA 那边不会长时间收不到数据）。
+			 *   按键唤醒同样 break。
 			 */
 			int64_t deadline = k_uptime_get() + (int64_t)SAMPLE_INTERVAL_MS;
 			uint32_t tick = 0U;
 
 			while (k_uptime_get() < deadline) {
+				bool present_before = vbus_pin_present;
+
 				if (k_sem_take(&wake_sem, SLEEP_POLL_MS) == 0) {
 					break;
 				}
 
-				if (vbus_present_now()) {
-					LOG_INF("插上充电器 → 立刻醒");
-					break;
+				if (vbus_present_now() != present_before) {
+					if (sample_ntc(&capture) == 0) {
+						temp_trend_update(capture.temp_centi);
+					}
+					publish_sensors(&capture, &ip);
+					(void)adv_apply(ADV_SLOW);
+
+					if (vbus_pin_present) {
+						LOG_INF("插上充电器 → 立刻醒");
+						break;
+					}
+
+					LOG_INF("拔掉充电器 → 立刻改报未充电");
 				}
 
 				if (++tick >= SLEEP_TEMP_TICKS) {
@@ -2795,7 +2995,10 @@ int main(void)
 					tick = 0U;
 					if (sample_ntc(&tmp) == 0) {
 						temp_trend_update(tmp.temp_centi);
-						if (temp_rising) {
+						publish_sensors(&tmp, &ip);
+						(void)adv_apply(ADV_SLOW);
+
+						if (temp_rising_active()) {
 							LOG_INF("温度突变爬升 → 立刻醒");
 							break;
 						}
