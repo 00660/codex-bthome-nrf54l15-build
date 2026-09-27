@@ -137,23 +137,29 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BAT_STATE_DISCHARGING 3U /* 放电中 */
 #define BAT_STATE_FULL 4U        /* 已充满 */
 
-/* ---------------- 充电器输入 VBUS（可选接线，默认关） ---------------- */
+/* ---------------- 充电器输入 VBUS（充电状态的可靠来源） ---------------- */
 
 /*
- * 模组第 16 脚 = P1.07 = AIN3，接法（要用的时候才接）：
+ * 模组第 16 脚 = P1.07 = AIN3。这是判断"插没插充电器"最靠谱的一路 ——
+ * 直接看充电输入有没有电，是数字信号，不用猜。
  *
- *   VBUS ──[1MΩ]──┬── 模组 16 脚
- *                 └──[150kΩ]── GND        分压约 7.67:1
+ *   IP5328 的 VBUS(32) 脚 ──[1MΩ]──┬── 模组 16 脚
+ *   （或 VIN(30) 脚、USB 口的 5V）  └──[150kΩ]── GND        分压约 7.67:1
  *
  * 5V → 0.65V，9V → 1.17V，12V → 1.56V，20V → 2.61V，都在满量程内。
  *
- * ★ 现在置 0：这一脚【悬空】，什么都没接。
- *   悬空脚的 ADC 读数会乱飘（实测报到 3335mV，按 7.67:1 反推输入端
- *   是 25.6V，根本不可能），会被当成"插着充电器"，纯属误导。
- *   接上分压之后再改成 1。
+ * ★ 现在置 1：接上分压就能用。
+ *   没接线时这一脚悬空，读数会乱飘 —— 所以下面有两道闸门拦它：
+ *     ① 读数必须落在 [250mV, 2800mV] 区间内
+ *     ② 一个采样窗口内最大最小值之差不能超过 30mV（真 VBUS 很稳，悬空脚会飘）
+ *   两道都过才算"插着充电器"，否则报 0。这样即使线没接也不会误报。
  */
-#define VBUS_ADC_ENABLE 0
+#define VBUS_ADC_ENABLE 1
 #define VBUS_ADC_MIN_PRESENT_MV 250U
+/* 7.67:1 下 2800mV 对应输入 21.5V，再高就超出任何合法快充档位了 */
+#define VBUS_ADC_MAX_PLAUSIBLE_MV 2800U
+/* 窗口内跳动超过这么多就认定是悬空脚在飘，不是真 VBUS */
+#define VBUS_ADC_MAX_RIPPLE_MV 30U
 
 /* ---------------- 电池电流（差分 ADC，可选接线） ---------------- */
 
@@ -177,8 +183,12 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * （两条腿共 4.2µA），不毁待机。这个偏置靠下面的 SHUNT_OFFSET_MV 减掉。
  *
  * 没接线时置 0，就不会去采样，报告里 [12:16] 恒为 0。
+ *
+ * ★ 现在置 0：这块板子拿去给别的设备供电，不需要采电流。
+ *   代码留着，接线接回来再把这里改成 1 就恢复。
+ *   关掉之后模组 5/6 脚（P1.13/P1.14）重新空出来，配成纯高阻。
  */
-#define SHUNT_ADC_ENABLE 1
+#define SHUNT_ADC_ENABLE 0
 #define SHUNT_DIVIDER_NUM 2U
 #define SHUNT_DIVIDER_DEN 1U
 
@@ -197,6 +207,12 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 
 /* 换算出来的电流超过这个数就认为读数不可信，报 0 */
 #define SHUNT_MAX_ABS_MA 15000
+
+/*
+ * 电流方向。模组 5/6 脚接反了（正负对调）就把这里改成 1，
+ * 不用拆线重焊。改完充电时应该读正、放电时读负。
+ */
+#define SHUNT_INVERT 0
 
 #define BATTERY_FULL_MV 3000U
 #define BATTERY_EMPTY_MV 2200U
@@ -1572,7 +1588,7 @@ static int configure_adc(void)
 		LOG_WRN("Battery ADC (模组 4 脚 / P1.12 / AIN5) 不可用，电池电压只能靠 IP5328");
 	}
 
-	/* 充电器输入 VBUS —— 这一路默认关掉，见 VBUS_ADC_ENABLE */
+	/* 充电器输入 VBUS —— 充电状态的主要依据，见 VBUS_ADC_ENABLE */
 	vbus_adc_ready = false;
 	if (VBUS_ADC_ENABLE && adc_is_ready_dt(&vbus_adc) && adc_channel_setup_dt(&vbus_adc) == 0) {
 		vbus_adc_ready = true;
@@ -1663,15 +1679,26 @@ static uint32_t ntc_resistance_ohms(uint32_t adc_mv, uint32_t vdd_mv)
 }
 
 /*
- * 由电池电压的变化方向推断充电状态。
+ * 判断充电状态。
  *
- * 每个采样点都累加进当前窗口；攒够 BAT_TREND_WINDOW_MS 就取平均值，
- * 和上一个窗口的平均值相减。涨够 BAT_TREND_MIN_MV 算充电，跌够算放电，
- * 都不够就看绝对电压：到 BAT_FULL_MV 以上又不动 → 充满，否则 → 待机。
+ * 两种信息源，VBUS 优先：
+ *
+ *   ① 模组第 16 脚 VBUS 有没有电 —— 直接、可靠、不猜。有电就是插着充电器。
+ *   ② 电池电压往哪边走 —— 兜底。窗口内每点累加，到点取平均再和上个窗口比。
+ *
+ * 只看 ② 是不靠谱的：实测电池读数在 4124~4140 之间跳（峰峰值 16mV），
+ * 而真实充电 5 分钟才涨 5~10mV，信噪比接近 1；电池接近满时电压被钉在
+ * 4.2V，斜率更是直接变成 0。所以 ② 只在没接 ① 的时候当兜底。
+ *
+ * 组合判断：
+ *   插着充电器               → CHARGING，除非电压已到 BAT_FULL_MV 又不动 → FULL
+ *   没插 + 电压在跌           → DISCHARGING
+ *   没插 + 电压不动 + 电压高   → FULL（静置的满电电池）
+ *   没插 + 其它               → IDLE
  *
  * 第一个窗口只用来打基准，所以第一次判断要等两个窗口。
  */
-static void bat_update_charge_state(uint16_t mv)
+static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 {
 	int64_t now;
 	uint16_t avg;
@@ -1695,9 +1722,12 @@ static void bat_update_charge_state(uint16_t mv)
 		bat_trend_valid = true;
 	} else {
 		int delta = (int)avg - (int)bat_trend_avg;
+		bool moving = (delta >= BAT_TREND_MIN_MV || delta <= -BAT_TREND_MIN_MV);
 
-		if (delta >= BAT_TREND_MIN_MV) {
-			bat_charge_state = BAT_STATE_CHARGING;
+		if (vbus_present) {
+			/* 插着充电器就是在充电，除非已经满了又不动 */
+			bat_charge_state = (avg >= BAT_FULL_MV && !moving) ? BAT_STATE_FULL
+									  : BAT_STATE_CHARGING;
 		} else if (delta <= -BAT_TREND_MIN_MV) {
 			bat_charge_state = BAT_STATE_DISCHARGING;
 		} else if (avg >= BAT_FULL_MV) {
@@ -1706,8 +1736,9 @@ static void bat_update_charge_state(uint16_t mv)
 			bat_charge_state = BAT_STATE_IDLE;
 		}
 
-		LOG_INF("charge state -> %u (avg %u -> %u mV, delta=%d, %u samples)",
-			bat_charge_state, bat_trend_avg, avg, delta, bat_trend_count);
+		LOG_INF("charge state -> %u (vbus=%u avg %u -> %u mV, delta=%d, %u samples)",
+			bat_charge_state, vbus_present, bat_trend_avg, avg, delta,
+			bat_trend_count);
 	}
 
 	bat_trend_avg = avg;
@@ -1724,6 +1755,8 @@ static int sample_ntc(struct ntc_capture *capture)
 	uint32_t vbus_sum = 0;
 	uint16_t bat_count = 0;
 	uint16_t vbus_count = 0;
+	uint16_t vbus_min = UINT16_MAX;
+	uint16_t vbus_max = 0;
 	uint32_t shunt_sum = 0;
 	uint16_t shunt_count = 0;
 	uint16_t adc_min = UINT16_MAX;
@@ -1776,8 +1809,12 @@ static int sample_ntc(struct ntc_capture *capture)
 		if (vbus_adc_ready) {
 			ret = read_adc_mv(&vbus_adc, &vbus_mv);
 			if (ret == 0) {
-				vbus_sum += (uint32_t)CLAMP(vbus_mv, 0, UINT16_MAX);
+				uint16_t v = (uint16_t)CLAMP(vbus_mv, 0, UINT16_MAX);
+
+				vbus_sum += v;
 				vbus_count++;
+				vbus_min = MIN(vbus_min, v);
+				vbus_max = MAX(vbus_max, v);
 			}
 		}
 
@@ -1827,11 +1864,19 @@ static int sample_ntc(struct ntc_capture *capture)
 		}
 	}
 
-	/* 充电器输入：分压后的值，够高就说明插着充电器，否则报 0（悬空 / 没插） */
+	/*
+	 * 充电器输入：两道闸门都过才算"插着充电器"，否则报 0。
+	 *   ① 平均值落在合理区间（太低 = 没插，太高 = 悬空脚乱飘）
+	 *   ② 窗口内跳动不超过 30mV（真 VBUS 稳，悬空脚会飘）
+	 * 这样第 16 脚没接线时也不会误报"插着充电器"。
+	 */
 	if (vbus_count > 0U) {
-		capture->vbus_mv = (uint16_t)(vbus_sum / vbus_count);
-		if (capture->vbus_mv < VBUS_ADC_MIN_PRESENT_MV) {
-			capture->vbus_mv = 0U;
+		uint16_t avg = (uint16_t)(vbus_sum / vbus_count);
+		uint16_t ripple = (uint16_t)(vbus_max - vbus_min);
+
+		if (avg >= VBUS_ADC_MIN_PRESENT_MV && avg <= VBUS_ADC_MAX_PLAUSIBLE_MV &&
+		    ripple <= VBUS_ADC_MAX_RIPPLE_MV) {
+			capture->vbus_mv = avg;
 		}
 	}
 
@@ -1843,9 +1888,16 @@ static int sample_ntc(struct ntc_capture *capture)
 	 */
 	if (shunt_count > 0U) {
 		int32_t avg = (int32_t)(shunt_sum / shunt_count) - 32768;
-		int32_t on_shunt_mv = (avg - SHUNT_OFFSET_MV) * (int32_t)SHUNT_DIVIDER_NUM /
-				      (int32_t)SHUNT_DIVIDER_DEN;
-		int32_t ma = on_shunt_mv * 1000 / (int32_t)SHUNT_MILLIOHM;
+		int32_t on_shunt_mv;
+		int32_t ma;
+
+		if (SHUNT_INVERT) {
+			avg = -avg;
+		}
+
+		on_shunt_mv = (avg - SHUNT_OFFSET_MV) * (int32_t)SHUNT_DIVIDER_NUM /
+			      (int32_t)SHUNT_DIVIDER_DEN;
+		ma = on_shunt_mv * 1000 / (int32_t)SHUNT_MILLIOHM;
 
 		if (ma > SHUNT_MAX_ABS_MA || ma < -SHUNT_MAX_ABS_MA) {
 			ma = 0; /* 读数不可信（多半是线没接好），别报出去吓人 */
@@ -1856,7 +1908,7 @@ static int sample_ntc(struct ntc_capture *capture)
 		capture->shunt_ma = (int16_t)CLAMP(ma, INT16_MIN, INT16_MAX);
 	}
 
-	bat_update_charge_state(capture->bat_mv);
+	bat_update_charge_state(capture->bat_mv, capture->vbus_mv != 0U);
 	capture->charge_state = bat_charge_state;
 
 	return 0;
