@@ -9,6 +9,12 @@
  *         > 3.6V 且 < 5V 才算插着充电器（没插 ≈3.59V，插着 ≈4.60V）
  *   4. 充电状态：VBUS 为主，电池电压斜率兜底
  *
+ * 对外协议（两套共存，见 prj.conf）：
+ *   1. BTHome v2 广播 —— 电量 / 温度 / 充电状态 / 电池电压 / 版本号，不用连
+ *   2. 标准 GATT —— Battery Service 0x180F（电量 0x2A19），
+ *      Device Information 0x180A（厂商 / 型号 / 固件版本）；
+ *      不懂 BTHome 的通用客户端连上就能读
+ *
  * IP5328 的 I2C 那套（模组 5/6/7 脚）代码还在，但默认关掉了 ——
  * 见 IP5328_I2C_ENABLE。关掉之后开机不用等 30 秒静默期、不跑总线诊断，
  * P1.13 / P1.04 都保持高阻（P1.14 现在给 VBUS 用）。
@@ -44,6 +50,7 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/dfu/mcuboot.h>
 #include <zephyr/drivers/adc.h>
@@ -694,10 +701,10 @@ BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
 
 /*
  * 广播包不能超过 31 字节，算一遍留个底：
- *   ad = flags(3) + service data(2+17) = 22 字节  ✓
+ *   ad = flags(3) + service data(2+17) + uuid16(2+2) = 26 字节  ✓
  * 以后加字段时注意别把这行撑爆（超了 bt_le_adv_start 会返回 -EINVAL）。
  */
-BUILD_ASSERT(sizeof(bthome_service_data) + 5U <= 31U);
+BUILD_ASSERT(sizeof(bthome_service_data) + 9U <= 31U);
 
 /* IP5328 全量数据，给 GATT 只读特征值用 */
 static uint8_t ip5328_report[IP5328_REPORT_LEN];
@@ -710,6 +717,12 @@ static uint8_t ip5328_report[IP5328_REPORT_LEN];
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
 	BT_DATA(BT_DATA_SVC_DATA16, bthome_service_data, sizeof(bthome_service_data)),
+	/*
+	 * 标准 Battery Service 的 16bit UUID（0x180F 小端）——
+	 * 广播里同时给出 BTHome 和标准电量服务，两套协议共存：
+	 * 懂 BTHome 的直接读广播，不懂的把它当普通电量设备连上读 0x2A19。
+	 */
+	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0x0F, 0x18),
 };
 
 static const struct bt_data sd[] = {
@@ -1850,10 +1863,13 @@ static uint32_t ntc_resistance_ohms(uint32_t adc_mv, uint32_t vdd_mv)
  * 4.2V，斜率更是直接变成 0。所以 ② 只在没接 ① 的时候当兜底。
  *
  * 组合判断：
- *   插着充电器               → CHARGING，除非电压已到 BAT_FULL_MV 又不动 → FULL
- *   没插 + 电压在跌           → DISCHARGING
- *   没插 + 电压不动 + 电压高   → FULL（静置的满电电池）
- *   没插 + 其它               → IDLE
+ *   插着充电器              → CHARGING，除非电压已到 BAT_FULL_MV 又不动 → FULL
+ *   没插 + 电压在跌          → DISCHARGING
+ *   没插 + 其它              → IDLE
+ *
+ * ★ 没插充电器时**永远不判 FULL** —— FULL 的含义是"插着且已充满"。
+ *   电池本来就 4.2V，拔线后如果还判 FULL，而广播里 CHARGING 和 FULL 都
+ *   报 charging=1，看起来就是"拔了充电器还一直在充电"。这是修掉的那个 bug。
  *
  * 第一个窗口只用来打基准，所以第一次判断要等两个窗口。
  */
@@ -1886,8 +1902,12 @@ static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 			/* 插上充电器：先当"充电中"。真满了由窗口逻辑（电压不再涨）判定 */
 			bat_charge_state = BAT_STATE_CHARGING;
 		} else {
-			/* 拔掉：电压到顶且静置才算满，否则就是待机 */
-			bat_charge_state = (mv >= BAT_FULL_MV) ? BAT_STATE_FULL : BAT_STATE_IDLE;
+			/*
+			 * 拔掉充电器：一律 IDLE —— 绝不能用 mv >= BAT_FULL_MV 判 FULL。
+			 * 那块电池本来就充到了 4.2V，一拔线就会满足这个条件，
+			 * 而广播把 FULL 也当成"插着充电器"，于是拔了线还显示充电中。
+			 */
+			bat_charge_state = BAT_STATE_IDLE;
 		}
 
 		LOG_INF("charge state -> %u (vbus=%u, 立即判定)", bat_charge_state, vbus_present);
@@ -1922,9 +1942,8 @@ static void bat_update_charge_state(uint16_t mv, bool vbus_present)
 									  : BAT_STATE_CHARGING;
 		} else if (delta <= -BAT_TREND_MIN_MV) {
 			bat_charge_state = BAT_STATE_DISCHARGING;
-		} else if (avg >= BAT_FULL_MV) {
-			bat_charge_state = BAT_STATE_FULL;
 		} else {
+			/* 没插充电器：只有 DISCHARGING / IDLE 两种，永远不判 FULL */
 			bat_charge_state = BAT_STATE_IDLE;
 		}
 
@@ -2233,6 +2252,13 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	bthome_service_data[BTHOME_VERSION_OFFSET] = APP_PATCHLEVEL;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 1U] = APP_VERSION_MINOR;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 2U] = APP_VERSION_MAJOR;
+
+	/*
+	 * 标准 Battery Service（0x180F / Battery Level 0x2A19）——
+	 * 和 BTHome 广播同时存在：任何通用 BLE 客户端（包括 HA 的通用集成，
+	 * 它根本不懂 BTHome）都能直接读出电量。
+	 */
+	(void)bt_bas_set_battery_level(MIN(soc, 100U));
 
 	ip5328_encode_report(ip, ntc);
 
