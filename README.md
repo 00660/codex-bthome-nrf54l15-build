@@ -10,11 +10,12 @@ IP5328 那套 I2C 代码全都还在（`src/main.c` 里一点没删），只是�
 - `P1.11 / AIN4`（模组第 3 脚）采样 NTC 分压点
 - `P1.12 / AIN5`（模组第 4 脚）采样电池分压点 —— **电池电压来源**（外部 1M+1M）
 - `P1.14 / AIN7`（模组第 6 脚）采样充电器输入分压点 —— **插没插充电器**，充电状态的主要依据（外部 1M+100k）
+  实测：没插 `0 mV`，插 USB 5V 输入 `467 mV`（≈5.14V，纹波 4mV）
 - 同时读 SAADC `VDD` 通道，用实际 GPIO 高电平换算 NTC 电阻
 - **充电状态**：**主要看模组第 6 脚有没有充电输入**（数字信号，直接可靠）；
   没接这一路时才退到"电池电压往哪边走"的斜率法
 - 只读 GATT：报告（16B）、总线诊断（34B，I2C 关掉时整包 `0xFF`）、版本号字符串
-- BLE 广播 BTHome v2：temperature、battery、voltage、firmware version
+- BLE 广播 BTHome v2：temperature、battery、voltage、**charging（充电中）**、firmware version
 - **双唤醒**：每 10 分钟定时醒一次 + 模组第 8 脚按键随时唤醒
 - 每轮醒来广播 120 秒（OTA 窗口），之后停止广播进入低功耗睡眠
 - **默认常醒测试模式**：不休眠、一直可连接，测完写一个特征切回正常休眠
@@ -291,12 +292,12 @@ KEY ── WLED(照明 LED，阳极在 KEY、阴极在 GND)
 
 ## BLE 广播
 
-设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 18 字节 service data）。
+设备名放在 scan response 里（广播包 31 字节放不下完整名字 + 16 字节 service data）。
 
-BTHome service data（18 字节）：
+BTHome service data（16 字节）：
 
 ```text
-D2 FC 40 01 BB 02 TT TT 0C VV VV 5D CC CC F2 PP MM JJ
+D2 FC 40 01 BB 02 TT TT 0C VV VV 15 CC F2 PP MM JJ
 ```
 
 | 字节 | 内容 |
@@ -306,10 +307,18 @@ D2 FC 40 01 BB 02 TT TT 0C VV VV 5D CC CC F2 PP MM JJ
 | `01 BB` | battery，uint8，单位 % |
 | `02 TT TT` | temperature，sint16，factor 0.01 °C |
 | `0C VV VV` | voltage，uint16，factor 0.001 V（电池电压） |
+| `15 CC` | **charging**，uint8，`1` = 插着充电器 / `0` = 没插 |
 | `F2 PP MM JJ` | firmware version，patch / minor / major |
 
 ⚠️ **BTHome 要求 object id 按数值从小到大排列**，接收端碰到不认识的 id 会直接停止解析后面的内容。
-所以顺序必须是 `01 < 02 < 0C < F2`，改字段时别打乱。
+所以顺序必须是 `01 < 02 < 0C < 15 < F2`，改字段时别打乱。
+
+`0x15` 是 BTHome 标准的 charging 对象，**只能表达布尔量**。取值规则：
+`charge_state` 是 `CHARGING`（正在充）或 `FULL`（插着但已充满）就报 `1`，
+其余（`IDLE` 待机 / `DISCHARGING` 放电 / `UNKNOWN` 还没攒够窗口）报 `0`。
+
+想要 `IDLE` / `DISCHARGING` / `FULL` **四态细分**的话，这个标准对象做不到 ——
+得去读 GATT 报告特征值的 `[10:12]`（见下一节）。
 
 电量百分比：有 IP5328 数据时用 BATOCV 查放电曲线表算；没有时用 ADC 实测的电池电压查同一张表；
 连电池分压都没接时，才回退到原来的 VDD 电压法。

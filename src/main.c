@@ -61,18 +61,26 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BTHOME_ID_BATTERY 0x01
 #define BTHOME_ID_TEMPERATURE 0x02
 #define BTHOME_ID_VOLTAGE 0x0C
+#define BTHOME_ID_CHARGING 0x15
 #define BTHOME_ID_FIRMWARE_VERSION 0xF2
 
 /*
  * BTHome 要求 object id 按数值从小到大排列，接收端碰到不认识的 id
- * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < F2。
+ * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < 15 < F2。
  *
  * 电流对象（0x5D）已经摘掉 —— 这块板子拿去给别的设备供电，不需要采电流。
+ *
+ * 0x15 = charging（布尔）。这是 BTHome 标准的"充电中"对象，
+ * 值 1 = 充电中 / 0 = 没充电。下面用它表达"插着充电器"：
+ * charge_state 是 CHARGING 或 FULL 就报 1，其余报 0。
+ * 想要 IDLE / DISCHARGING / FULL 四态细分的话，这个标准对象做不到，
+ * 得去读 GATT 报告特征值（6f6b0201-…）的 [10:12]。
  */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
 #define BTHOME_VOLTAGE_OFFSET 9U
-#define BTHOME_VERSION_OFFSET 12U
+#define BTHOME_CHARGING_OFFSET 12U
+#define BTHOME_VERSION_OFFSET 13U
 
 /* ---------------- NTC ---------------- */
 
@@ -483,12 +491,13 @@ static uint32_t diag_key_count;
 static bool diag_from_key;
 
 /*
- * BTHome service data，18 字节：
+ * BTHome service data，16 字节：
  *   D2 FC         BTHome UUID，小端
  *   40            BTHome v2，未加密
  *   01 BB         battery，uint8，%
  *   02 TT TT      temperature，sint16，0.01 °C
  *   0C VV VV      voltage，uint16，0.001 V
+ *   15 CC         charging，uint8，1 = 插着充电器 / 0 = 没插
  *   F2 PP MM JJ   firmware version，patch/minor/major
  */
 static uint8_t bthome_service_data[] = {
@@ -503,6 +512,8 @@ static uint8_t bthome_service_data[] = {
 	BTHOME_ID_VOLTAGE,
 	0x00,
 	0x00,
+	BTHOME_ID_CHARGING,
+	0x00,
 	BTHOME_ID_FIRMWARE_VERSION,
 	APP_PATCHLEVEL,
 	APP_VERSION_MINOR,
@@ -515,10 +526,10 @@ BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
 static uint8_t ip5328_report[IP5328_REPORT_LEN];
 
 /*
- * 广播包只有 31 字节，加了 current 之后 BTHome service data 变成 18 字节，
- * 再塞完整设备名就超了。所以设备名挪到 scan response 里，两边都放得下：
- *   ad = flags(3) + service data(20) = 23 字节
- *   sd = name(9) + 128bit UUID(18)   = 27 字节
+ * 广播包只有 31 字节，BTHome service data 16 字节，再塞完整设备名就超了。
+ * 所以设备名挪到 scan response 里，两边都放得下：
+ *   ad = flags(3) + service data(2+16) = 21 字节
+ *   sd = name(9) + 128bit UUID(18)     = 27 字节
  */
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR),
@@ -1876,6 +1887,15 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	bthome_service_data[BTHOME_BATTERY_OFFSET] = soc;
 	put_s16_le(&bthome_service_data[BTHOME_TEMP_OFFSET], ntc->temp_centi);
 	sys_put_le16(volt_mv, &bthome_service_data[BTHOME_VOLTAGE_OFFSET]);
+	/*
+	 * 0x15 charging：这是布尔量，只能表达"有没有在充电"。
+	 * CHARGING（正在充）和 FULL（插着但已充满）都算"插着充电器"报 1，
+	 * 其余（IDLE 待机 / DISCHARGING 放电 / UNKNOWN 没攒够窗口）报 0。
+	 */
+	bthome_service_data[BTHOME_CHARGING_OFFSET] =
+		(ntc->charge_state == BAT_STATE_CHARGING || ntc->charge_state == BAT_STATE_FULL)
+			? 1U
+			: 0U;
 	bthome_service_data[BTHOME_VERSION_OFFSET] = APP_PATCHLEVEL;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 1U] = APP_VERSION_MINOR;
 	bthome_service_data[BTHOME_VERSION_OFFSET + 2U] = APP_VERSION_MAJOR;
