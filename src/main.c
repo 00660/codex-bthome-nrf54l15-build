@@ -758,8 +758,16 @@ static int ip5328_read_registers(struct ip5328_data *d)
  * 模组第 8 脚 = P1.02 接的是 IP5328 的 KEY 网络。
  * 按键按下时 KEY 被拉到地，用这个下降沿唤醒 MCU。
  *
- * 引脚配成纯高阻输入，不开内部上拉：KEY 网络在 IP5328 内部本来就有上拉，
- * 再叠一个 MCU 内部上拉只会白耗 ~240µA，把深睡电流整个毁掉。
+ * 【必须开内部上拉】手册从头到尾没说 KEY 有内部上拉，图 3 的接法是
+ *   KEY ──[R]──[按键]── GND
+ *   KEY ── WLED(照明 LED，阳极在 KEY、阴极在 GND)
+ * 那个 LED 会把 KEY 钳在 ~1.8V，低于 nRF54L15 在 3.1V 供电下的判决门限
+ * （约 2.17V）—— 结果是不按键和按下都读成低，边沿永远不来，
+ * 第 8 脚唤醒等于没接。开内部上拉把静止电平抬到门限以上才行。
+ * （ESP32-C3 那边同样是必须开内部上拉才能唤醒，现象一致。）
+ *
+ * 代价：nRF 内部上拉约 13k，静止时白耗 ~240µA。量产如果在意这个数，
+ * 可以在 KEY 网络对 3.1V 挂一颗 100k 外部上拉，然后把这里改回纯高阻。
  */
 static void key_pressed_cb(const struct device *port, struct gpio_callback *cb,
 			   gpio_port_pins_t pins)
@@ -776,7 +784,7 @@ static int configure_key_wakeup(void)
 {
 	int ret;
 
-	ret = gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT);
+	ret = gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT | GPIO_PULL_UP);
 	if (ret) {
 		LOG_ERR("KEY pin configure failed: %d", ret);
 		return ret;
@@ -820,8 +828,12 @@ static int ip5328_int_level(void)
  * 模组第 8 脚就挂在 KEY 网络上，直接驱动到低就等于按下按键。
  * 拉低期间先关掉 KEY 中断，免得自己触发一次"按键唤醒"。
  *
- * 返回放开 50ms 后第 8 脚的电平：还在高说明 KEY 网络上确实有上拉，
- * 模组这根线接对了。要是放开了还是低，那 8 脚根本没接在 KEY 网络上。
+ * 返回放开 50ms 后、并且把内部上拉打开之后，第 8 脚的电平：
+ *   读到高 → 内部上拉能压过 KEY 网络上的负载，按键按下一定能产生下降沿，
+ *            第 8 脚唤醒可用；
+ *   仍是低 → KEY 网络被 WLED 照明 LED（或别的下拉）钳得太死，
+ *            内部上拉抬不起来，按键唤醒就废了 —— 这时候得在 KEY 网络
+ *            对 3.1V 挂一颗 100k 外部上拉，或者干脆换唤醒源。
  */
 static int ip5328_key_press(uint32_t ms)
 {
@@ -834,7 +846,7 @@ static int ip5328_key_press(uint32_t ms)
 	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8, GPIO_INT_DISABLE);
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_OUTPUT_LOW);
 	k_msleep(ms);
-	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT);
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT | GPIO_PULL_UP);
 	k_msleep(50);
 
 	level = gpio_pin_get(ip_port, IP5328_PIN_M8);
@@ -970,7 +982,8 @@ static void ip_line_probe(uint32_t pin, uint8_t *low_release, uint8_t *high_rele
  *   [21]    按 KEY 之后 probe 0x75 的结果，0 = 收到 ACK，0xFF = 没测
  *   [22]    按 KEY 之后 INT(P1.04) 加内部上拉时的电平
  *   [23]    按 KEY 之后快速全地址扫描命中数
- *   [24]    按 KEY 放开 50ms 后第 8 脚的电平，1 = KEY 网络上确实有上拉
+ *   [24]    按 KEY 放开 50ms 后第 8 脚的电平（此时内部上拉已打开），
+ *           1 = 上拉能压过 KEY 网络的负载，按键唤醒可用；0 = 被钳死，唤醒废
  *   [25]    [26] 第 8 脚：驱动低放开 / 驱动高放开 1ms 后的电平
  *   [27]    [28] 第 7 脚（INT）：同上
  *   [29]    第 13 脚（NFC2，本该悬空）：驱动低放开后的电平
@@ -1152,8 +1165,8 @@ static void ip5328_diag_run(void)
 	ip_line_probe(IP5328_PIN_M7, &ip5328_diag[27], &ip5328_diag[28]);
 	ip_line_probe(IP5328_PIN_NFC2, &ip5328_diag[29], &unused_high);
 
-	/* 三根线各自还原：8 脚按键输入，7 脚 INT 输入，13 脚高阻 */
-	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT);
+	/* 三根线各自还原：8 脚按键输入（带内部上拉），7 脚 INT 输入，13 脚高阻 */
+	(void)gpio_pin_configure(ip_port, IP5328_PIN_M8, GPIO_INPUT | GPIO_PULL_UP);
 	(void)gpio_pin_interrupt_configure(ip_port, IP5328_PIN_M8,
 					   GPIO_INT_EDGE_TO_INACTIVE);
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_M7, GPIO_INPUT | GPIO_PULL_DOWN);
@@ -1277,8 +1290,8 @@ static int configure_ip5328_io(void)
 	/* 第 8 脚的 KEY 中断在 configure_key_wakeup() 里单独配 */
 
 	/*
-	 * P1.03 是 NFC2，和 P1.02 一样是 NFC 脚。两个 NFC 脚被驱动到不同电平
-	 * 会有额外漏电流，所以也配成纯高阻，跟 P1.02 一样不驱动、不加上拉。
+	 * P1.03 是 NFC2。NFC 已经整个 disable，两个 NFC 脚之间没有漏电通路，
+	 * 而且这一脚板子上是空着的，所以保持纯高阻就行（诊断里当空白对照）。
 	 */
 	(void)gpio_pin_configure(ip_port, IP5328_PIN_NFC2, GPIO_INPUT);
 
