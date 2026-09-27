@@ -61,14 +61,23 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 #define BTHOME_ID_BATTERY 0x01
 #define BTHOME_ID_TEMPERATURE 0x02
 #define BTHOME_ID_VOLTAGE 0x0C
+#define BTHOME_ID_VBUS_VOLTAGE 0x0E
 #define BTHOME_ID_CHARGING 0x15
 #define BTHOME_ID_FIRMWARE_VERSION 0xF2
 
 /*
  * BTHome 要求 object id 按数值从小到大排列，接收端碰到不认识的 id
- * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < 15 < F2。
+ * 就直接停止解析后面的内容。所以顺序必须是 01 < 02 < 0C < 0E < 15 < F2。
  *
  * 电流对象（0x5D）已经摘掉 —— 这块板子拿去给别的设备供电，不需要采电流。
+ *
+ * 0x0C = voltage      —— 电池电压（主电压）
+ * 0x0E = generic voltage —— 充电器输入电压（VBUS 反算回来的真实值）
+ *
+ * 为什么充电输出电压用 0x0E 而不是再来一个 0x0C：
+ * BTHome 里同一个广播包里 0x0C 只能出现一次（接收端按键取值，重复会打架），
+ * 而 0x0E 就是给"另一个电压"准备的通用电压对象，精度同样是 0.001V。
+ * 有些 App 会把 0x0E 显示成"电压 2"或"通用电压"，也有的不显示 —— 看 App 实现。
  *
  * 0x15 = charging（布尔）。这是 BTHome 标准的"充电中"对象，
  * 值 1 = 充电中 / 0 = 没充电。下面用它表达"插着充电器"：
@@ -81,20 +90,22 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 不包括前面那个 object id 字节。
  *
  * 对照（下标从 0 开始）：
- *   0  1  2   : D2 FC 40          BTHome UUID + v2 标识
- *   3  4      : 01 BB             battery
- *   5  6  7   : 02 TT TT          temperature
- *   8  9  10  : 0C VV VV          voltage
- *   11 12     : 15 CC             charging
- *   13 14 15 16: F2 PP MM JJ      firmware version
+ *   0  1  2      : D2 FC 40          BTHome UUID + v2 标识
+ *   3  4         : 01 BB             battery
+ *   5  6  7      : 02 TT TT          temperature
+ *   8  9  10     : 0C VV VV          voltage（电池）
+ *   11 12 13     : 0E II II          generic voltage（充电输入）
+ *   14 15        : 15 CC             charging
+ *   16 17 18 19  : F2 PP MM JJ       firmware version
  *
- * 所以 VERSION_OFFSET = 14（PP 的下标），数组总长 = 14 + 3 = 17。
+ * 所以 VERSION_OFFSET = 17（PP 的下标），数组总长 = 17 + 3 = 20。
  */
 #define BTHOME_BATTERY_OFFSET 4U
 #define BTHOME_TEMP_OFFSET 6U
 #define BTHOME_VOLTAGE_OFFSET 9U
-#define BTHOME_CHARGING_OFFSET 12U
-#define BTHOME_VERSION_OFFSET 14U
+#define BTHOME_VBUS_VOLTAGE_OFFSET 12U
+#define BTHOME_CHARGING_OFFSET 15U
+#define BTHOME_VERSION_OFFSET 17U
 
 /* ---------------- NTC ---------------- */
 
@@ -191,6 +202,22 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
 /* 窗口内跳动超过这么多就认定是悬空脚在飘，不是真 VBUS */
 #define VBUS_ADC_MAX_RIPPLE_MV 30U
 
+/*
+ * 分压比，用来把 ADC 读到的分压值**反算回输入端真实电压**，
+ * 好让广播里能显示"充电输入 5.13V"这种可读的东西。
+ *
+ *   VIN = 分压读数 × (1M + 100k) / 100k = 读数 × 11
+ *
+ * 实测：USB 5V 输入读 466mV → 466 × 11 = 5126mV。略高于 5V 是正常的
+ * （线损、电阻误差、USB 口实际输出 5.1V 左右）。
+ *
+ * 注意：这个反算值精度有限 —— 1M 和 100k 本身有 1% 误差，合起来约 2%，
+ * 在 5V 上有 ±100mV 的不确定度。所以它适合"看个大概"，不能当万用表。
+ * 只有通过了上面两道闸门（确认真的插着充电器）时才反算。
+ */
+#define VBUS_DIVIDER_NUM 11U
+#define VBUS_DIVIDER_DEN 1U
+
 /* ---------------- 电池电流：已取消 ---------------- */
 
 /*
@@ -200,8 +227,7 @@ LOG_MODULE_REGISTER(ntc_thl, LOG_LEVEL_INF);
  * 1M+1M 分压到 AIN6/AIN7）记在 README 里，真要恢复照着接就行。
  */
 
-#define BATTERY_FULL_MV 3000U
-#define BATTERY_EMPTY_MV 2200U
+/* 电池电压 → 电量百分比走的是下面 soc_table[] 那条放电曲线，不再用两点直线 */
 
 /* ---------------- 运行周期 ---------------- */
 
@@ -356,6 +382,8 @@ struct ntc_capture {
 	uint16_t bat_raw_mv;
 	/* 模组第 6 脚 (P1.14/AIN7) 分压后测到的充电器输入电压（未换算回 VBUS 端） */
 	uint16_t vbus_mv;
+	/* 上一个值反算回输入端的真实电压（mV）。没插充电器时为 0 */
+	uint16_t vbus_in_mv;
 	/* 充电状态，见 BAT_STATE_* */
 	uint8_t charge_state;
 };
@@ -505,12 +533,13 @@ static uint32_t diag_key_count;
 static bool diag_from_key;
 
 /*
- * BTHome service data，17 字节：
+ * BTHome service data，20 字节：
  *   D2 FC         BTHome UUID，小端
  *   40            BTHome v2，未加密
  *   01 BB         battery，uint8，%
  *   02 TT TT      temperature，sint16，0.01 °C
- *   0C VV VV      voltage，uint16，0.001 V
+ *   0C VV VV      voltage，uint16，0.001 V（电池电压）
+ *   0E II II      generic voltage，uint16，0.001 V（充电输入电压，反算过）
  *   15 CC         charging，uint8，1 = 插着充电器 / 0 = 没插
  *   F2 PP MM JJ   firmware version，patch/minor/major
  */
@@ -524,6 +553,9 @@ static uint8_t bthome_service_data[] = {
 	0x00,
 	0x00,
 	BTHOME_ID_VOLTAGE,
+	0x00,
+	0x00,
+	BTHOME_ID_VBUS_VOLTAGE,
 	0x00,
 	0x00,
 	BTHOME_ID_CHARGING,
@@ -545,9 +577,9 @@ BUILD_ASSERT(sizeof(bthome_service_data) == BTHOME_VERSION_OFFSET + 3U);
 static uint8_t ip5328_report[IP5328_REPORT_LEN];
 
 /*
- * 广播包只有 31 字节，BTHome service data 17 字节，再塞完整设备名就超了。
+ * 广播包只有 31 字节，BTHome service data 20 字节，再塞完整设备名就超了。
  * 所以设备名挪到 scan response 里，两边都放得下：
- *   ad = flags(3) + service data(2+17) = 22 字节
+ *   ad = flags(3) + service data(2+20) = 25 字节
  *   sd = name(9) + 128bit UUID(18)     = 27 字节
  */
 static const struct bt_data ad[] = {
@@ -1497,19 +1529,60 @@ static void put_s16_le(uint8_t *dst, int32_t value)
 	sys_put_le16((uint16_t)(int16_t)clamp_s16(value), dst);
 }
 
+/*
+ * 电池电压 → 电量百分比。
+ *
+ * 用 soc_table[] 这条锂电池放电曲线（4.35V 满充 → 3.3V 空）线性插值，
+ * 而不是拿 BATTERY_FULL_MV/BATTERY_EMPTY_MV 做两点直线。
+ *
+ * 为什么必须查表：锂电池的放电曲线是**中间很平、两头很陡**的。
+ * 4.0~3.7V 这一段占了大概 60% 的容量，但电压只差 300mV。用两点直线的话，
+ * 这个区间里电压动一点，百分比就跳一大截，读数毫无意义。
+ *
+ * 另外要清楚：**光靠电压永远推不出准确电量**。同样的 3.8V，空载静置
+ * 可能是 45%，带载放电时可能是 25%。所以这里给的是"静置开压估计值"，
+ * 只有在电池静置、没有大电流时才比较可信。
+ *
+ * 之前那个实现是 mv>=3000 就直接返回 100，而实测电池 4130mV，
+ * 所以永远报 100% —— 现在改成查表，4130mV 大约落到 83%。
+ */
 static uint8_t battery_percent_from_mv(uint16_t mv)
 {
-	if (mv >= BATTERY_FULL_MV) {
-		return 100U;
+	size_t n = ARRAY_SIZE(soc_table);
+
+	if (mv >= soc_table[0].mv) {
+		return soc_table[0].pct;
 	}
 
-	if (mv <= BATTERY_EMPTY_MV) {
-		return 0U;
+	if (mv <= soc_table[n - 1U].mv) {
+		return soc_table[n - 1U].pct;
 	}
 
-	return (uint8_t)(((uint32_t)(mv - BATTERY_EMPTY_MV) * 100U +
-			  (BATTERY_FULL_MV - BATTERY_EMPTY_MV) / 2U) /
-			 (BATTERY_FULL_MV - BATTERY_EMPTY_MV));
+	/* 表是按电压降序排的，找到 mv 落在哪两个点之间 */
+	for (size_t i = 0U; i + 1U < n; i++) {
+		uint16_t hi_mv = soc_table[i].mv;
+		uint16_t lo_mv = soc_table[i + 1U].mv;
+
+		if (mv <= hi_mv && mv >= lo_mv) {
+			uint8_t hi_pct = soc_table[i].pct;
+			uint8_t lo_pct = soc_table[i + 1U].pct;
+			uint32_t span_mv = (uint32_t)(hi_mv - lo_mv);
+			uint32_t offset = (uint32_t)(hi_mv - mv);
+
+			/* pct = hi_pct - (hi_pct - lo_pct) * offset / span，四舍五入 */
+			uint32_t drop = (uint32_t)(hi_pct - lo_pct) * offset;
+
+			if (span_mv == 0U) {
+				return hi_pct;
+			}
+
+			return (uint8_t)((uint32_t)hi_pct -
+					 (drop + span_mv / 2U) / span_mv);
+		}
+	}
+
+	/* 理论上到不了这里 */
+	return 0U;
 }
 
 static void ntc_power_off(void)
@@ -1853,7 +1926,7 @@ static int sample_ntc(struct ntc_capture *capture)
 	 * 充电器输入：两道闸门都过才算"插着充电器"，否则报 0。
 	 *   ① 平均值落在合理区间（太低 = 没插，太高 = 悬空脚乱飘）
 	 *   ② 窗口内跳动不超过 30mV（真 VBUS 稳，悬空脚会飘）
-	 * 这样第 7 脚没接线时也不会误报"插着充电器"。
+	 * 这样第 6 脚没接线时也不会误报"插着充电器"。
 	 */
 	if (vbus_count > 0U) {
 		uint16_t avg = (uint16_t)(vbus_sum / vbus_count);
@@ -1862,6 +1935,13 @@ static int sample_ntc(struct ntc_capture *capture)
 		if (avg >= VBUS_ADC_MIN_PRESENT_MV && avg <= VBUS_ADC_MAX_PLAUSIBLE_MV &&
 		    ripple <= VBUS_ADC_MAX_RIPPLE_MV) {
 			capture->vbus_mv = avg;
+			/*
+			 * 确认插着充电器了，才反算回输入端的真实电压给广播用。
+			 * 没插时留在 0，广播里 0x0E 就是 0（App 显示 0V，一看就知道没插）。
+			 */
+			uint32_t vin = (uint32_t)avg * VBUS_DIVIDER_NUM / VBUS_DIVIDER_DEN;
+
+			capture->vbus_in_mv = (uint16_t)MIN(vin, UINT16_MAX);
 		}
 	}
 
@@ -1907,6 +1987,11 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 	put_s16_le(&bthome_service_data[BTHOME_TEMP_OFFSET], ntc->temp_centi);
 	sys_put_le16(volt_mv, &bthome_service_data[BTHOME_VOLTAGE_OFFSET]);
 	/*
+	 * 0x0E generic voltage：充电器输入电压（已经把 11:1 分压反算回去了）。
+	 * 没插充电器时是 0，App 上显示 0V，一眼就知道没插。
+	 */
+	sys_put_le16(ntc->vbus_in_mv, &bthome_service_data[BTHOME_VBUS_VOLTAGE_OFFSET]);
+	/*
 	 * 0x15 charging：这是布尔量，只能表达"有没有在充电"。
 	 * CHARGING（正在充）和 FULL（插着但已充满）都算"插着充电器"报 1，
 	 * 其余（IDLE 待机 / DISCHARGING 放电 / UNKNOWN 没攒够窗口）报 0。
@@ -1925,7 +2010,8 @@ static void encode_sensors(const struct ntc_capture *ntc, const struct ip5328_da
 		abs(ntc->temp_centi % 100), ntc->ntc_ohms, ntc->adc_mv, ntc->vdd_mv,
 		ntc->sample_count);
 	LOG_INF("batadc raw=%umV -> bat=%umV soc=%u", ntc->bat_raw_mv, ntc->bat_mv, soc);
-	LOG_INF("vbus=%umV charge_state=%u", ntc->vbus_mv, ntc->charge_state);
+	LOG_INF("vbus=%umV -> vin=%umV charge_state=%u", ntc->vbus_mv, ntc->vbus_in_mv,
+		ntc->charge_state);
 	LOG_INF("ip5328 valid=%u bind=%u err=%d st=%u chg=%u full=%u stage=%u soc=%u "
 		"ocv=%umV vad=%umV i=%dmA vsys=%umV isys=%dmA p=%umW int=%d",
 		ip->valid, ip->bind, ip->error, ip->sys_state, ip->charging, ip->full,
