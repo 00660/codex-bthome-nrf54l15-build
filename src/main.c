@@ -2659,15 +2659,26 @@ enum adv_mode {
 
 static enum adv_mode adv_current = ADV_OFF;
 
+/*
+ * ★★ 两套广播参数必须定义在【文件作用域】，不能写在函数里再返回地址 ★★
+ *
+ * BT_LE_ADV_CONN_FAST_2 / BT_LE_ADV_PARAM 展开出来的是**复合字面量**：
+ * 写在函数内部时，它的生命周期只到该函数返回为止。0.40.0 曾经把它写在
+ * adv_param_for() 里、再把地址返回出去，于是 bt_le_adv_start() 拿到的是一块
+ * 已经失效的栈内存（未定义行为）：参数是垃圾值时它返回 -EINVAL，而调用点
+ * 是 (void)start_advertising() —— 返回值被丢掉。
+ * 症状就是最坏的那一种：设备活着、采样正常、特征读得到，但**一个字都不广播**
+ * → 扫不到 → 连不上 → 再也 OTA 不进去（只能有线刷）。
+ * 放文件作用域，生命周期 = 整个程序，取地址永远安全。
+ */
+static const struct bt_le_adv_param *const adv_fast_param = BT_LE_ADV_CONN_FAST_2;
+/* 1 秒一条（0x0640 = 1600 × 0.625ms）、可连接、无超时 */
+static const struct bt_le_adv_param *const adv_slow_param =
+	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, 0x0640, 0x0640, NULL);
+
 static const struct bt_le_adv_param *adv_param_for(enum adv_mode mode)
 {
-	if (mode == ADV_FAST) {
-		/* 数组形式的复合字面量，取首元素地址 */
-		return &BT_LE_ADV_CONN_FAST_2[0];
-	}
-
-	/* 1 秒一条（0x0640 = 1600 × 0.625ms）、可连接、无超时 */
-	return &BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN, 0x0640, 0x0640, NULL)[0];
+	return mode == ADV_FAST ? adv_fast_param : adv_slow_param;
 }
 
 /*
@@ -2707,7 +2718,14 @@ static int adv_apply(enum adv_mode mode)
 	}
 
 	if (ret) {
+		/*
+		 * 失败不留状态：清掉 adv_current，下一次调用就走"先 stop 再 start"
+		 * 的完整路径重试，而不是在同一模式上打转。
+		 * 广播开不起来是致命的（扫不到 = 连不上 = 再也 OTA 不了），
+		 * 所以这里必须能自愈，不能一失败就永久静默。
+		 */
 		LOG_ERR("advertising (mode %u) failed: %d", (unsigned int)mode, ret);
+		adv_current = ADV_OFF;
 		return ret;
 	}
 
@@ -2873,7 +2891,19 @@ int main(void)
 	 * 我们以前一上电就探测、拉低、全地址扫描，很可能正好把它的检测过程搅掉，
 	 * 它一旦没进模式，之后怎么读都不会应答。
 	 */
-	(void)start_advertising();
+	/*
+	 * ★ 开播失败不能就这么算了。广播是设备的唯一入口（HA 读数据、电脑 OTA
+	 *   都靠它），不广播 = 这台设备从此再也进不去（只能有线刷）。
+	 *   所以这里失败就隔一秒重试，仍失败也留日志；main 循环里还会继续重试。
+	 */
+	for (int attempt = 0; attempt < 5; attempt++) {
+		if (start_advertising() == 0) {
+			break;
+		}
+		LOG_ERR("广播启动失败，第 %d 次重试", attempt + 1);
+		k_sleep(K_SECONDS(1));
+	}
+
 	k_sleep(K_MSEC(IP5328_QUIET_BOOT_MS));
 
 	while (true) {
